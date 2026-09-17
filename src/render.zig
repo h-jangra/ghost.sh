@@ -108,6 +108,203 @@ pub fn getMaxCandidateWidth(candidates: []const []const u8) usize {
     return max_len;
 }
 
+pub fn appendBufferWithCrlf(buf: *ArrayList(u8), text: []const u8) !void {
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '\r') {
+            if (i + 1 < text.len and text[i + 1] == '\n') {
+                try buf.appendSlice(text[start .. i + 2]);
+                i += 2;
+                start = i;
+            } else {
+                try buf.appendSlice(text[start .. i + 1]);
+                i += 1;
+                start = i;
+            }
+        } else if (text[i] == '\n') {
+            try buf.appendSlice(text[start..i]);
+            try buf.appendSlice("\r\n");
+            i += 1;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if (start < text.len) {
+        try buf.appendSlice(text[start..]);
+    }
+}
+
+pub const TextLayout = struct {
+    cursor_row: usize,
+    cursor_col: usize,
+    end_row: usize,
+    end_col: usize,
+    total_rows: usize,
+};
+
+fn advanceCol(row: *usize, col: *usize, w: usize, cols: usize) void {
+    if (w == 0) return;
+    if (col.* + w > cols) {
+        row.* += 1;
+        col.* = if (w <= cols) w else cols;
+    } else {
+        col.* += w;
+    }
+}
+
+fn advanceTab(row: *usize, col: *usize, cols: usize) void {
+    const tab_w: usize = 8 - (col.* % 8);
+    if (col.* + tab_w > cols) {
+        row.* += 1;
+        col.* = (col.* + tab_w) - cols;
+        if (col.* >= cols) col.* = cols - 1;
+    } else {
+        col.* += tab_w;
+    }
+}
+
+fn processSlice(
+    slice: []const u8,
+    cursor_pos_opt: ?usize,
+    row: *usize,
+    col: *usize,
+    cursor_row: *usize,
+    cursor_col: *usize,
+    cursor_recorded: *bool,
+    cols: usize,
+) void {
+    var i: usize = 0;
+    while (i < slice.len) {
+        if (cursor_pos_opt) |cp| {
+            if (!cursor_recorded.* and i >= cp) {
+                cursor_row.* = row.*;
+                cursor_col.* = col.*;
+                cursor_recorded.* = true;
+            }
+        }
+
+        const b = slice[i];
+        if (b == 0x1b) {
+            var j = i + 1;
+            if (j < slice.len and (slice[j] == '[' or slice[j] == ']')) {
+                j += 1;
+                while (j < slice.len and !((slice[j] >= 'a' and slice[j] <= 'z') or (slice[j] >= 'A' and slice[j] <= 'Z') or slice[j] == '\x07')) : (j += 1) {}
+                if (j < slice.len) j += 1;
+            }
+            i = j;
+            continue;
+        }
+
+        if (b == 0x01 or b == 0x02) {
+            i += 1;
+            continue;
+        }
+
+        if (b == '\n') {
+            row.* += 1;
+            col.* = 0;
+            i += 1;
+        } else if (b == '\r') {
+            col.* = 0;
+            i += 1;
+            if (i < slice.len and slice[i] == '\n') {
+                row.* += 1;
+                i += 1;
+            }
+        } else if (b == '\t') {
+            advanceTab(row, col, cols);
+            i += 1;
+        } else {
+            var w: usize = 1;
+            var seq_len: usize = 1;
+            if (b < 0x80) {
+                w = if (b >= 32 and b != 127) 1 else 0;
+                seq_len = 1;
+            } else {
+                seq_len = std.unicode.utf8ByteSequenceLength(b) catch 1;
+                if (i + seq_len <= slice.len) {
+                    if (std.unicode.utf8Decode(slice[i .. i + seq_len])) |cp| {
+                        w = if (isFullWidth(cp)) 2 else 1;
+                    } else |_| {
+                        w = 1;
+                    }
+                } else {
+                    seq_len = 1;
+                    w = 1;
+                }
+            }
+            advanceCol(row, col, w, cols);
+            i += seq_len;
+        }
+    }
+}
+
+pub fn calculateLayout(
+    prompt_w: usize,
+    buffer: []const u8,
+    cursor_pos: usize,
+    ghost_suggestion: ?[]const u8,
+    term_cols: usize,
+) TextLayout {
+    const cols = if (term_cols > 0) term_cols else 80;
+    var row: usize = prompt_w / cols;
+    var col: usize = prompt_w % cols;
+
+    var cursor_row: usize = row;
+    var cursor_col: usize = col;
+    var cursor_recorded: bool = false;
+
+    if (cursor_pos == 0) {
+        cursor_row = row;
+        cursor_col = col;
+        cursor_recorded = true;
+    }
+
+    processSlice(
+        buffer,
+        cursor_pos,
+        &row,
+        &col,
+        &cursor_row,
+        &cursor_col,
+        &cursor_recorded,
+        cols,
+    );
+
+    if (!cursor_recorded) {
+        cursor_row = row;
+        cursor_col = col;
+        cursor_recorded = true;
+    }
+
+    if (ghost_suggestion) |ghost| {
+        processSlice(
+            ghost,
+            null,
+            &row,
+            &col,
+            &cursor_row,
+            &cursor_col,
+            &cursor_recorded,
+            cols,
+        );
+    }
+
+    const end_row = row;
+    const end_col = col;
+    const total_rows = end_row + 1;
+
+    return .{
+        .cursor_row = cursor_row,
+        .cursor_col = if (cols > 0) @min(cursor_col, cols - 1) else cursor_col,
+        .end_row = end_row,
+        .end_col = if (cols > 0) @min(end_col, cols - 1) else end_col,
+        .total_rows = total_rows,
+    };
+}
+
 pub fn renderEditor(editor: *Editor) !void {
     editor.render_buf.clearRetainingCapacity();
     const buf = &editor.render_buf;
@@ -115,59 +312,104 @@ pub fn renderEditor(editor: *Editor) !void {
     const ws = editor.term.getWindowSize();
     const term_cols: usize = if (ws.cols > 0) ws.cols else 80;
 
+    // Hide cursor while rendering
+    try buf.appendSlice("\x1b[?25l");
+
+    // If first render, output prefix of multi-line prompt if any
     if (editor.first_render and editor.prompt_prefix.len > 0) {
         try buf.appendSlice(editor.prompt_prefix);
-        editor.first_render = false;
     }
 
-    try buf.appendSlice("\x1b[?25l\r\x1b[2K");
+    // Step 1: Move from previous cursor position back to prompt origin (Row 0, Col 0)
+    if (!editor.first_render and editor.rendered_cursor_row > 0) {
+        try appendFmt(buf, "\x1b[{d}A", .{editor.rendered_cursor_row});
+    }
+    try buf.appendSlice("\r");
+
+    // Step 2: Clear all previously rendered rows
+    const old_rows = if (editor.first_render) 0 else (editor.rendered_total_rows + editor.rendered_menu_rows);
+    if (old_rows > 1) {
+        try buf.appendSlice("\x1b[2K");
+        var r: usize = 1;
+        while (r < old_rows) : (r += 1) {
+            try buf.appendSlice("\x1b[B\x1b[2K");
+        }
+        try appendFmt(buf, "\x1b[{d}A\r", .{old_rows - 1});
+    } else {
+        try buf.appendSlice("\x1b[2K");
+    }
+
+    editor.first_render = false;
 
     if (editor.in_isearch) {
-        try appendFmt(buf, "(reverse-i-search)`{s}': {s}", .{ editor.isearch_query.items, editor.buffer.items });
-        if (editor.rendered_menu_rows > 0) {
-            try writeClearMenu(buf, editor.rendered_menu_rows);
-            editor.rendered_menu_rows = 0;
-        }
-
-        try buf.appendSlice("\r");
         var prefix_buf: [256]u8 = undefined;
         const prefix_str = std.fmt.bufPrint(&prefix_buf, "(reverse-i-search)`{s}': ", .{editor.isearch_query.items}) catch "(reverse-i-search)`': ";
-        var total_offset = getVisibleWidth(prefix_str);
+        const prefix_w = getVisibleWidth(prefix_str);
+
+        var match_pos: usize = editor.buffer.items.len;
         if (editor.isearch_query.items.len > 0) {
             if (std.mem.indexOf(u8, editor.buffer.items, editor.isearch_query.items)) |idx| {
-                total_offset += getVisibleWidth(editor.buffer.items[0..idx]);
+                match_pos = idx;
             }
         }
-        if (total_offset > 0) try appendFmt(buf, "\x1b[{d}C", .{total_offset});
+
+        const isearch_layout = calculateLayout(prefix_w, editor.buffer.items, match_pos, null, term_cols);
+
+        try buf.appendSlice(prefix_str);
+        try appendBufferWithCrlf(buf, editor.buffer.items);
+
+        const rows_up = isearch_layout.end_row - isearch_layout.cursor_row;
+        if (rows_up > 0) {
+            try appendFmt(buf, "\x1b[{d}A", .{rows_up});
+        }
+        try buf.appendSlice("\r");
+        if (isearch_layout.cursor_col > 0) {
+            try appendFmt(buf, "\x1b[{d}C", .{isearch_layout.cursor_col});
+        }
+
+        editor.rendered_cursor_row = isearch_layout.cursor_row;
+        editor.rendered_total_rows = isearch_layout.total_rows;
+        editor.rendered_menu_rows = 0;
+
         try buf.appendSlice("\x1b[?25h");
         terminal.writeAll(editor.term.tty_fd, buf.items);
         return;
     }
 
+    const layout = calculateLayout(
+        editor.prompt_vis_w,
+        editor.buffer.items,
+        editor.cursor_pos,
+        editor.ghost_suggestion,
+        term_cols,
+    );
+
     try buf.appendSlice(editor.prompt_last_line);
-    try buf.appendSlice(editor.buffer.items);
+    try appendBufferWithCrlf(buf, editor.buffer.items);
 
     if (editor.ghost_suggestion) |sugg| {
-        try appendFmt(buf, "\x1b[38;5;244m{s}\x1b[0m", .{sugg});
+        try buf.appendSlice("\x1b[38;5;244m");
+        try appendBufferWithCrlf(buf, sugg);
+        try buf.appendSlice("\x1b[0m");
     }
 
     var vis_rows: usize = 0;
     if (editor.in_completion and editor.candidates.items.len > 0) {
         const max_w = if (editor.max_candidate_width > 0) editor.max_candidate_width else getMaxCandidateWidth(editor.candidates.items);
-        const layout = MenuLayout.calculate(editor.candidates.items.len, max_w, term_cols);
-        vis_rows = layout.vis_rows;
+        const menu_layout = MenuLayout.calculate(editor.candidates.items.len, max_w, term_cols);
+        vis_rows = menu_layout.vis_rows;
 
-        const cur_row = editor.selected_candidate / layout.num_cols;
+        const cur_row = editor.selected_candidate / menu_layout.num_cols;
         const start_row = if (cur_row >= vis_rows) cur_row - vis_rows + 1 else 0;
 
         var r = start_row;
         var drawn_lines: usize = 0;
-        while (r < start_row + vis_rows and r < layout.total_rows) : (r += 1) {
+        while (r < start_row + vis_rows and r < menu_layout.total_rows) : (r += 1) {
             try buf.appendSlice("\n\r\x1b[2K");
             drawn_lines += 1;
             var c: usize = 0;
-            while (c < layout.num_cols) : (c += 1) {
-                const idx = r * layout.num_cols + c;
+            while (c < menu_layout.num_cols) : (c += 1) {
+                const idx = r * menu_layout.num_cols + c;
                 if (idx < editor.candidates.items.len) {
                     const item = editor.candidates.items[idx];
                     const is_selected = (idx == editor.selected_candidate);
@@ -180,10 +422,10 @@ pub fn renderEditor(editor: *Editor) !void {
                     }
 
                     const item_vw = getVisibleWidth(item);
-                    if (item_vw > layout.col_w - 1 and layout.col_w >= 3) {
+                    if (item_vw > menu_layout.col_w - 1 and menu_layout.col_w >= 3) {
                         var trunc_bytes: usize = 0;
                         var cur_w: usize = 0;
-                        while (trunc_bytes < item.len and cur_w + 2 < layout.col_w) {
+                        while (trunc_bytes < item.len and cur_w + 2 < menu_layout.col_w) {
                             const slen = std.unicode.utf8ByteSequenceLength(item[trunc_bytes]) catch 1;
                             if (trunc_bytes + slen > item.len) break;
                             cur_w += if (isFullWidth(std.unicode.utf8Decode(item[trunc_bytes .. trunc_bytes + slen]) catch 0)) 2 else 1;
@@ -191,14 +433,14 @@ pub fn renderEditor(editor: *Editor) !void {
                         }
                         try buf.appendSlice(item[0..trunc_bytes]);
                         try buf.appendSlice("…");
-                        if (layout.col_w > cur_w + 2) {
-                            var pad = (layout.col_w - 1) - (cur_w + 1);
+                        if (menu_layout.col_w > cur_w + 2) {
+                            var pad = (menu_layout.col_w - 1) - (cur_w + 1);
                             while (pad > 0) : (pad -= 1) try buf.append(' ');
                         }
                     } else {
                         try buf.appendSlice(item);
-                        if (layout.col_w > item_vw + 1) {
-                            var pad = (layout.col_w - 1) - item_vw;
+                        if (menu_layout.col_w > item_vw + 1) {
+                            var pad = (menu_layout.col_w - 1) - item_vw;
                             while (pad > 0) : (pad -= 1) try buf.append(' ');
                         }
                     }
@@ -208,14 +450,20 @@ pub fn renderEditor(editor: *Editor) !void {
         }
 
         if (drawn_lines > 0) try appendFmt(buf, "\x1b[{d}A", .{drawn_lines});
-    } else if (editor.rendered_menu_rows > 0) {
-        try writeClearMenu(buf, editor.rendered_menu_rows);
     }
     editor.rendered_menu_rows = vis_rows;
 
+    const rows_up = layout.end_row - layout.cursor_row;
+    if (rows_up > 0) {
+        try appendFmt(buf, "\x1b[{d}A", .{rows_up});
+    }
     try buf.appendSlice("\r");
-    const total_offset = editor.prompt_vis_w + getVisibleWidth(editor.buffer.items[0..editor.cursor_pos]);
-    if (total_offset > 0) try appendFmt(buf, "\x1b[{d}C", .{total_offset});
+    if (layout.cursor_col > 0) {
+        try appendFmt(buf, "\x1b[{d}C", .{layout.cursor_col});
+    }
+
+    editor.rendered_cursor_row = layout.cursor_row;
+    editor.rendered_total_rows = layout.total_rows;
 
     try buf.appendSlice("\x1b[?25h");
     terminal.writeAll(editor.term.tty_fd, buf.items);
@@ -240,4 +488,73 @@ test "renderEditor with and without ghost suggestion" {
     try renderEditor(&ed);
     try std.testing.expect(std.mem.indexOf(u8, ed.render_buf.items, "\x1b[38;5;244m") == null);
     try std.testing.expect(std.mem.indexOf(u8, ed.render_buf.items, "> ll") != null);
+}
+
+test "calculateLayout single line and multi line" {
+    // Single line
+    const l1 = calculateLayout(2, "hello", 5, null, 80);
+    try std.testing.expectEqual(@as(usize, 0), l1.cursor_row);
+    try std.testing.expectEqual(@as(usize, 7), l1.cursor_col);
+    try std.testing.expectEqual(@as(usize, 0), l1.end_row);
+    try std.testing.expectEqual(@as(usize, 7), l1.end_col);
+    try std.testing.expectEqual(@as(usize, 1), l1.total_rows);
+
+    // Multi line with \n
+    const multiline = "line1\nline2\nline3";
+    const l2 = calculateLayout(2, multiline, multiline.len, null, 80);
+    try std.testing.expectEqual(@as(usize, 2), l2.cursor_row);
+    try std.testing.expectEqual(@as(usize, 5), l2.cursor_col);
+    try std.testing.expectEqual(@as(usize, 2), l2.end_row);
+    try std.testing.expectEqual(@as(usize, 5), l2.end_col);
+    try std.testing.expectEqual(@as(usize, 3), l2.total_rows);
+
+    // Cursor in the middle of multiline
+    const l3 = calculateLayout(2, multiline, 2, null, 80);
+    try std.testing.expectEqual(@as(usize, 0), l3.cursor_row);
+    try std.testing.expectEqual(@as(usize, 4), l3.cursor_col); // prompt 2 + "li" (2)
+    try std.testing.expectEqual(@as(usize, 2), l3.end_row);
+    try std.testing.expectEqual(@as(usize, 3), l3.total_rows);
+}
+
+test "calculateLayout wrapping on terminal width" {
+    // 10 cols, prompt width 2, command 15 'a's
+    const text = "aaaaaaaaaaaaaaa";
+    // Cursor at index 3: row 0, col 5 (2 + 3)
+    const l1 = calculateLayout(2, text, 3, null, 10);
+    try std.testing.expectEqual(@as(usize, 0), l1.cursor_row);
+    try std.testing.expectEqual(@as(usize, 5), l1.cursor_col);
+    try std.testing.expectEqual(@as(usize, 1), l1.end_row);
+    try std.testing.expectEqual(@as(usize, 2), l1.total_rows);
+
+    // With ghost suggestion that wraps into row 2
+    const ghost = "bbbbbbbbbb";
+    const l2 = calculateLayout(2, text, 3, ghost, 10);
+    try std.testing.expectEqual(@as(usize, 0), l2.cursor_row);
+    try std.testing.expectEqual(@as(usize, 5), l2.cursor_col);
+    try std.testing.expectEqual(@as(usize, 2), l2.end_row);
+    try std.testing.expectEqual(@as(usize, 3), l2.total_rows);
+}
+
+test "renderEditor multi-line clean redraw without duplication" {
+    const allocator = std.testing.allocator;
+    const term = try terminal.Term.init();
+    defer @constCast(&term).deinit();
+
+    var ed = Editor.init(allocator, std.testing.io, std.process.Environ.empty, &term, "> ");
+    defer ed.deinit();
+
+    try ed.buffer.appendSlice("first line\nsecond line");
+    ed.cursor_pos = ed.buffer.items.len;
+
+    // Render 1
+    try renderEditor(&ed);
+    try std.testing.expectEqual(@as(usize, 1), ed.rendered_cursor_row);
+    try std.testing.expectEqual(@as(usize, 2), ed.rendered_total_rows);
+
+    // Render 2 (simulating next event / keystroke)
+    try renderEditor(&ed);
+    // Verifying it moved up 1 line (\x1b[1A) and cleared 2 rows (\x1b[2K...\x1b[B\x1b[2K)
+    try std.testing.expect(std.mem.indexOf(u8, ed.render_buf.items, "\x1b[1A\r\x1b[2K\x1b[B\x1b[2K\x1b[1A\r") != null);
+    try std.testing.expectEqual(@as(usize, 1), ed.rendered_cursor_row);
+    try std.testing.expectEqual(@as(usize, 2), ed.rendered_total_rows);
 }

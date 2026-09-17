@@ -197,17 +197,6 @@ pub fn main(init: std.process.Init) !void {
                         editor.selected_candidate = 0;
                         editor.applySelectedCompletion(true);
                     } else if (editor.candidates.items.len > 1) {
-                        const total = editor.candidates.items.len;
-                        const ws = term.getWindowSize();
-                        const cols: usize = if (ws.cols > 0) ws.cols else 80;
-                        const layout = MenuLayout.calculate(total, render.getMaxCandidateWidth(editor.candidates.items), cols);
-
-                        if (!editor.in_completion and layout.vis_rows > 0) {
-                            var pre_scroll: usize = 0;
-                            while (pre_scroll < layout.vis_rows) : (pre_scroll += 1) terminal.writeAll(term.tty_fd, "\n");
-                            var up_buf: [32]u8 = undefined;
-                            if (std.fmt.bufPrint(&up_buf, "\x1b[{d}A", .{layout.vis_rows})) |seq| terminal.writeAll(term.tty_fd, seq) else |_| {}
-                        }
                         editor.in_completion = true;
                         editor.selected_candidate = 0;
                     }
@@ -222,7 +211,7 @@ pub fn main(init: std.process.Init) !void {
                         terminal.writeAll(term.tty_fd, "\r\nghost: ");
                         terminal.writeAll(term.tty_fd, err);
                         terminal.writeAll(term.tty_fd, "\r\n");
-                        editor.first_render = true;
+                        editor.resetRenderState();
                         editor.updateGhost();
                         try render.renderEditor(&editor);
                         continue;
@@ -232,7 +221,7 @@ pub fn main(init: std.process.Init) !void {
                         editor.cursor_pos = editor.buffer.items.len;
                         editor.cleanMenu();
                         terminal.writeAll(term.tty_fd, "\r\n");
-                        editor.first_render = true;
+                        editor.resetRenderState();
                         editor.updateGhost();
                         try render.renderEditor(&editor);
                         continue;
@@ -271,6 +260,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (accepted) {
+        editor.cursor_pos = editor.buffer.items.len;
         editor.ghost_suggestion = null;
         editor.in_completion = false;
         editor.in_isearch = false;

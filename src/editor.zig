@@ -59,6 +59,8 @@ pub const Editor = struct {
     prompt_last_line: []const u8,
     prompt_vis_w: usize = 0,
     first_render: bool = true,
+    rendered_cursor_row: usize = 0,
+    rendered_total_rows: usize = 0,
     buffer: ArrayList(u8),
     cursor_pos: usize = 0,
     history: ArrayList([]const u8),
@@ -463,16 +465,29 @@ pub const Editor = struct {
         if (self.cursor_pos < self.buffer.items.len) self.cursor_pos += 1;
     }
 
+    pub fn resetRenderState(self: *Editor) void {
+        self.first_render = true;
+        self.rendered_cursor_row = 0;
+        self.rendered_total_rows = 0;
+        self.rendered_menu_rows = 0;
+    }
+
     pub fn clearScreen(self: *Editor) !void {
         terminal.writeAll(self.term.tty_fd, "\x1b[2J\x1b[H");
-        self.first_render = true;
+        self.resetRenderState();
     }
 
     pub fn cleanMenu(self: *Editor) void {
         if (self.rendered_menu_rows > 0) {
             var clear_buf = ArrayList(u8).init(self.allocator);
             defer clear_buf.deinit();
+            const down = if (self.rendered_total_rows > self.rendered_cursor_row + 1)
+                (self.rendered_total_rows - 1) - self.rendered_cursor_row
+            else
+                0;
+            if (down > 0) render.appendFmt(&clear_buf, "\x1b[{d}B", .{down}) catch {};
             render.writeClearMenu(&clear_buf, self.rendered_menu_rows) catch {};
+            if (down > 0) render.appendFmt(&clear_buf, "\x1b[{d}A", .{down}) catch {};
             terminal.writeAll(self.term.tty_fd, clear_buf.items);
             self.rendered_menu_rows = 0;
         }
@@ -528,7 +543,7 @@ pub const Editor = struct {
         self.cursor_pos = self.buffer.items.len;
 
         if (trimmed.len > 0) return true;
-        self.first_render = true;
+        self.resetRenderState();
         return false;
     }
 
@@ -622,7 +637,7 @@ pub const Editor = struct {
                     self.hist_index = null;
                 }
 
-                self.first_render = true;
+                self.resetRenderState();
                 return true;
             }
         }
