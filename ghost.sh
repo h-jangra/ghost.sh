@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# Ghost shell frontend with compiled Zig binary
+# Ghost shell frontend with compiled binary
 
-if [[ -z "${_GHOST_BIN:-}" ]]; then
-    if [[ -x "$(dirname "${BASH_SOURCE[0]}")/ghost" ]]; then
-        _GHOST_BIN="$(dirname "${BASH_SOURCE[0]}")/ghost"
-    elif [[ -x "$(dirname "${BASH_SOURCE[0]}")/zig-out/bin/ghost" ]]; then
-        _GHOST_BIN="$(dirname "${BASH_SOURCE[0]}")/zig-out/bin/ghost"
-    else
-        _GHOST_BIN="ghost"
-    fi
-fi
+_GHOST_BIN="$(dirname "${BASH_SOURCE[0]}")/ghost"
+
+shopt -s autocd          # Auto-cd into directories
+shopt -s cdspell         # Correct directory typos
+shopt -s checkwinsize    # Update terminal dimensions
+shopt -s histappend      # Append command history
+shopt -s cmdhist         # Save multiline commands
+shopt -s lithist         # Preserve history newlines
+shopt -s direxpand       # Expand directory completion
+shopt -s cdable_vars     # Allow variables as directories
+shopt -s expand_aliases  # Enable aliases
+shopt -s checkjobs       # Warn about running jobs
+shopt -s globstar        # Enable recursive ** globbing
+shopt -s nocaseglob      # Case-insensitive globbing
 
 _ghost_run_prompt_command() {
     local _ghost_last_status=$1
@@ -55,14 +60,14 @@ _ghost_readline_hook() {
         _ghost_run_prompt_command "$_ghost_last_status"
         _ghost_last_status=$?
 
-        # Flush current session history to disk so Zig can access the latest commands
+        # Flush current session history to disk so binary can access the latest commands
         history -a 2>/dev/null
 
         local prompt_expanded
         (exit "$_ghost_last_status")
         prompt_expanded="${PS1@P}"
 
-        # Run Zig frontend with full TTY ownership
+        # Run binary with full TTY ownership
         "$_GHOST_BIN" --prompt "$prompt_expanded" --histfile "$hist_file" --output "$tmp_out" </dev/tty >/dev/tty 2>/dev/tty
         local status=$?
 
