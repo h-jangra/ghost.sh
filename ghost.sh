@@ -16,6 +16,24 @@ shopt -s checkjobs       # Warn about running jobs
 shopt -s globstar        # Enable recursive ** globbing
 shopt -s nocaseglob      # Case-insensitive globbing
 
+_ghost_try_autocd() {
+    shopt -q autocd 2>/dev/null || return 1
+    local op="[|&;<>()\`]"
+    [[ "$1" =~ $op || "$1" == *$'\n'* ]] && return 1
+    local -a w=()
+    eval "w=($1)" 2>/dev/null || return 1
+    (( ${#w[@]} == 1 )) || return 1
+    local d="${w[0]}"
+    [[ -z "$d" ]] && return 1
+    [[ "$1" != *"/"* ]] && type -t "$d" >/dev/null 2>&1 && return 1
+    if (cd -- "$d") &>/dev/null; then
+        printf 'cd -- %s\n' "$d"
+        cd -- "$d"
+        return 0
+    fi
+    return 1
+}
+
 _ghost_run_prompt_command() {
     local _ghost_last_status=$1
     if [[ "${PROMPT_COMMAND@a}" == *a* ]]; then
@@ -78,8 +96,12 @@ _ghost_readline_hook() {
             if [[ -n "$cmd" ]]; then
                 history -s "$cmd" 2>/dev/null
                 history -a 2>/dev/null
-                eval "$cmd"
-                _ghost_last_status=$?
+                if _ghost_try_autocd "$cmd"; then
+                    _ghost_last_status=$?
+                else
+                    eval "$cmd"
+                    _ghost_last_status=$?
+                fi
             else
                 _ghost_last_status=0
             fi

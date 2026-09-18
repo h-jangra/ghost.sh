@@ -57,7 +57,12 @@ Not as smooth as the binary, but available if needed. Source the provided shell 
 Add to your `~/.bashrc` and reload shell:
 
 ```bash
-source /usr/share/ghost/ghost.sh
+if [[ -f "/usr/share/ghost/ghost.sh" ]]; then
+    source "/usr/share/ghost/ghost.sh"
+fi
+```
+
+```bash
 source ~/.bashrc
 ```
 
