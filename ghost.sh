@@ -11,11 +11,36 @@ if [[ -z "${_GHOST_BIN:-}" ]]; then
     fi
 fi
 
+_ghost_run_prompt_command() {
+    local _ghost_last_status=$1
+    if [[ "${PROMPT_COMMAND@a}" == *a* ]]; then
+        local _ghost_hook
+        for _ghost_hook in "${PROMPT_COMMAND[@]}"; do
+            [[ "$_ghost_hook" =~ ^[[:space:]]*_ghost_readline_hook[[:space:]]*$ ]] && continue
+            (exit "$_ghost_last_status")
+            eval "$_ghost_hook"
+            _ghost_last_status=$?
+        done
+    elif [[ -n "${PROMPT_COMMAND:-}" ]]; then
+        (exit "$_ghost_last_status")
+        eval "$PROMPT_COMMAND"
+        _ghost_last_status=$?
+    fi
+    return "$_ghost_last_status"
+}
+
 _ghost_readline_hook() {
     # If binary is not available or terminal not interactive, fall back to standard readline
     if ! command -v "$_GHOST_BIN" >/dev/null 2>&1 || [[ ! -t 0 || ! -t 1 || ! -r /dev/tty ]]; then
         return
     fi
+
+    # Recursion guard: prevent re-entering loop if PROMPT_COMMAND invokes this hook
+    if [[ -n "${_GHOST_ACTIVE:-}" ]]; then
+        return "$?"
+    fi
+    local _GHOST_ACTIVE=1
+    local _ghost_last_status=$?
 
     local hist_file="${HISTFILE:-$HOME/.bash_history}"
     local tmp_out
@@ -26,10 +51,15 @@ _ghost_readline_hook() {
     fi
 
     while true; do
+        # Run prompt commands (e.g. zoxide, direnv, starship, PS1 generators)
+        _ghost_run_prompt_command "$_ghost_last_status"
+        _ghost_last_status=$?
+
         # Flush current session history to disk so Zig can access the latest commands
         history -a 2>/dev/null
 
         local prompt_expanded
+        (exit "$_ghost_last_status")
         prompt_expanded="${PS1@P}"
 
         # Run Zig frontend with full TTY ownership
@@ -44,12 +74,16 @@ _ghost_readline_hook() {
                 history -s "$cmd" 2>/dev/null
                 history -a 2>/dev/null
                 eval "$cmd"
+                _ghost_last_status=$?
+            else
+                _ghost_last_status=0
             fi
         elif (( status == 1 )); then
             # Ctrl-D on empty line (EOF) -> exit shell immediately
             rm -f "$tmp_out" 2>/dev/null
             exit 0
         elif (( status == 130 )); then
+            _ghost_last_status=130
             > "$tmp_out"
             continue
         else

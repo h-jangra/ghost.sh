@@ -810,6 +810,75 @@ pub fn collectBashCompletions(
     }
 }
 
+fn collectZoxideCompletions(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: std.process.Environ,
+    candidates: *std.array_list.AlignedManaged([]const u8, null),
+    token: []const u8,
+) void {
+    if (token.len == 0) return;
+
+    const argv: []const []const u8 = &[_][]const u8{ "zoxide", "query", "-l", "--", token };
+
+    const res = std.process.run(allocator, io, .{
+        .argv = argv,
+        .stdout_limit = std.Io.Limit.limited(128 * 1024),
+    }) catch return;
+    defer allocator.free(res.stdout);
+    defer allocator.free(res.stderr);
+
+    if (res.term != .exited or res.term.exited != 0) return;
+
+    var pwd_buf: [4096]u8 = undefined;
+    const pwd_opt = getEnv(environ, "PWD") orelse getProcEnviron("PWD", &pwd_buf);
+
+    var home_buf: [4096]u8 = undefined;
+    const home_opt = getEnv(environ, "HOME") orelse getProcEnviron("HOME", &home_buf);
+
+    var it = std.mem.splitScalar(u8, res.stdout, '\n');
+    while (it.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, "\r ");
+        if (line.len == 0) continue;
+
+        // Skip current working directory
+        if (pwd_opt) |pwd| {
+            if (std.mem.eql(u8, line, pwd)) continue;
+        }
+
+        var cand_buf: [4096]u8 = undefined;
+        var cand: []const u8 = line;
+
+        // If inside current working directory, show path relative to pwd
+        if (pwd_opt) |pwd| {
+            if (std.mem.startsWith(u8, line, pwd) and line.len > pwd.len) {
+                const rel = line[pwd.len..];
+                if (rel[0] == '/') {
+                    cand = rel[1..];
+                }
+            } else if (!std.mem.startsWith(u8, token, "/") and home_opt != null and std.mem.startsWith(u8, line, home_opt.?)) {
+                const rel = line[home_opt.?.len..];
+                if (rel.len == 0 or rel[0] == '/') {
+                    cand = std.fmt.bufPrint(&cand_buf, "~{s}", .{rel}) catch line;
+                }
+            }
+        } else if (!std.mem.startsWith(u8, token, "/") and home_opt != null and std.mem.startsWith(u8, line, home_opt.?)) {
+            const rel = line[home_opt.?.len..];
+            if (rel.len == 0 or rel[0] == '/') {
+                cand = std.fmt.bufPrint(&cand_buf, "~{s}", .{rel}) catch line;
+            }
+        }
+
+        if (cand.len > 0 and cand[cand.len - 1] != '/') {
+            var with_slash_buf: [4096]u8 = undefined;
+            const with_slash = std.fmt.bufPrint(&with_slash_buf, "{s}/", .{cand}) catch continue;
+            addCandidate(allocator, candidates, with_slash);
+        } else {
+            addCandidate(allocator, candidates, cand);
+        }
+    }
+}
+
 pub fn collectCompletionsWithEnv(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -864,10 +933,17 @@ pub fn collectCompletionsWithEnv(
         }
     }
 
+    if (std.mem.eql(u8, pos_info.prefix, "z") or std.mem.eql(u8, pos_info.prefix, "zi")) {
+        expandPathNative(allocator, environ, candidates, token, true);
+        if (candidates.items.len > 0) return;
+
+        collectZoxideCompletions(allocator, io, environ, candidates, token);
+        if (candidates.items.len > 0) return;
+    }
+
     if (std.mem.eql(u8, pos_info.prefix, "cd") or
         std.mem.eql(u8, pos_info.prefix, "pushd") or
         std.mem.eql(u8, pos_info.prefix, "rmdir") or
-        std.mem.eql(u8, pos_info.prefix, "z") or
         std.mem.eql(u8, pos_info.prefix, "builtin cd"))
     {
         expandPathNative(allocator, environ, candidates, token, true);
@@ -1135,4 +1211,15 @@ test "CommandCache builtin and PATH matching" {
     const echo_match = cache.findMatch("ec");
     try std.testing.expect(echo_match != null);
     try std.testing.expectEqualStrings("echo", echo_match.?);
+}
+
+test "collectZoxideCompletions test" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var candidates = std.array_list.AlignedManaged([]const u8, null).init(allocator);
+    defer {
+        for (candidates.items) |c| allocator.free(c);
+        candidates.deinit();
+    }
+    collectZoxideCompletions(allocator, io, std.process.Environ.empty, &candidates, "");
 }
