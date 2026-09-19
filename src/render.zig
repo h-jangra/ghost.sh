@@ -37,6 +37,61 @@ fn isFullWidth(cp: u21) bool {
         (cp >= 0x20000 and cp <= 0x3FFFD);
 }
 
+pub fn skipNonPrinting(s: []const u8, i: usize) usize {
+    if (i >= s.len) return i;
+    const b = s[i];
+    if (b == 0x01) {
+        var j = i + 1;
+        while (j < s.len and s[j] != 0x02 and s[j] != '\n') : (j += 1) {}
+        if (j < s.len and s[j] == 0x02) j += 1;
+        return j;
+    }
+    if (b == 0x02) {
+        return i + 1;
+    }
+    if (b == 0x1b) {
+        if (i + 1 >= s.len) return i + 1;
+        const next = s[i + 1];
+        if (next == '[') {
+            var j = i + 2;
+            while (j < s.len and s[j] >= 0x20 and s[j] <= 0x3F) : (j += 1) {}
+            if (j < s.len and s[j] >= 0x40 and s[j] <= 0x7E) j += 1;
+            return j;
+        }
+        if (next == ']' or next == 'P' or next == '_' or next == '^' or next == 'X') {
+            var j = i + 2;
+            while (j < s.len) {
+                if (s[j] == 0x07) {
+                    j += 1;
+                    break;
+                }
+                if (s[j] == 0x1b and j + 1 < s.len and s[j + 1] == '\\') {
+                    j += 2;
+                    break;
+                }
+                if (s[j] == 0x9c) {
+                    j += 1;
+                    break;
+                }
+                if (s[j] == '\n') break;
+                j += 1;
+            }
+            return j;
+        }
+        if (next >= 0x20 and next <= 0x2F) {
+            var j = i + 2;
+            while (j < s.len and s[j] >= 0x20 and s[j] <= 0x2F) : (j += 1) {}
+            if (j < s.len and s[j] >= 0x30 and s[j] <= 0x7E) j += 1;
+            return j;
+        }
+        if (next >= 0x30 and next <= 0x7E) {
+            return i + 2;
+        }
+        return i + 1;
+    }
+    return i;
+}
+
 pub fn getVisibleWidth(s: []const u8) usize {
     var last_line = s;
     if (std.mem.lastIndexOfScalar(u8, s, '\n')) |idx| last_line = s[idx + 1 ..];
@@ -45,22 +100,13 @@ pub fn getVisibleWidth(s: []const u8) usize {
     var w: usize = 0;
     var i: usize = 0;
     while (i < last_line.len) {
-        if (last_line[i] == 0x1b) {
-            i += 1;
-            if (i < last_line.len and (last_line[i] == '[' or last_line[i] == ']')) {
-                i += 1;
-                while (i < last_line.len and !((last_line[i] >= 'a' and last_line[i] <= 'z') or (last_line[i] >= 'A' and last_line[i] <= 'Z') or last_line[i] == '\x07')) : (i += 1) {}
-                if (i < last_line.len) i += 1;
-            }
+        const next_i = skipNonPrinting(last_line, i);
+        if (next_i > i) {
+            i = next_i;
             continue;
         }
 
         const b = last_line[i];
-        if (b == 0x01 or b == 0x02) {
-            i += 1;
-            continue;
-        }
-
         if (b < 0x80) {
             if (b >= 32 and b != 127) w += 1;
             i += 1;
@@ -185,23 +231,13 @@ fn processSlice(
             }
         }
 
+        const next_i = skipNonPrinting(slice, i);
+        if (next_i > i) {
+            i = next_i;
+            continue;
+        }
+
         const b = slice[i];
-        if (b == 0x1b) {
-            var j = i + 1;
-            if (j < slice.len and (slice[j] == '[' or slice[j] == ']')) {
-                j += 1;
-                while (j < slice.len and !((slice[j] >= 'a' and slice[j] <= 'z') or (slice[j] >= 'A' and slice[j] <= 'Z') or slice[j] == '\x07')) : (j += 1) {}
-                if (j < slice.len) j += 1;
-            }
-            i = j;
-            continue;
-        }
-
-        if (b == 0x01 or b == 0x02) {
-            i += 1;
-            continue;
-        }
-
         if (b == '\n') {
             row.* += 1;
             col.* = 0;
@@ -317,7 +353,7 @@ pub fn renderEditor(editor: *Editor) !void {
 
     // If first render, output prefix of multi-line prompt if any
     if (editor.first_render and editor.prompt_prefix.len > 0) {
-        try buf.appendSlice(editor.prompt_prefix);
+        try appendBufferWithCrlf(buf, editor.prompt_prefix);
     }
 
     // Step 1: Move from previous cursor position back to prompt origin (Row 0, Col 0)
@@ -426,6 +462,11 @@ pub fn renderEditor(editor: *Editor) !void {
                         var trunc_bytes: usize = 0;
                         var cur_w: usize = 0;
                         while (trunc_bytes < item.len and cur_w + 2 < menu_layout.col_w) {
+                            const next_tb = skipNonPrinting(item, trunc_bytes);
+                            if (next_tb > trunc_bytes) {
+                                trunc_bytes = next_tb;
+                                continue;
+                            }
                             const slen = std.unicode.utf8ByteSequenceLength(item[trunc_bytes]) catch 1;
                             if (trunc_bytes + slen > item.len) break;
                             cur_w += if (isFullWidth(std.unicode.utf8Decode(item[trunc_bytes .. trunc_bytes + slen]) catch 0)) 2 else 1;
@@ -558,3 +599,48 @@ test "renderEditor multi-line clean redraw without duplication" {
     try std.testing.expectEqual(@as(usize, 1), ed.rendered_cursor_row);
     try std.testing.expectEqual(@as(usize, 2), ed.rendered_total_rows);
 }
+
+test "skipNonPrinting and getVisibleWidth with Kitty shell integration" {
+    // Exact Kitty PS1 expanded string from bash with kitty shell integration
+    const kitty_ps1 = "\x01\x1b]133;k;start_kitty\x07\x02\x01\x1b]133;D;0\x07\x1b]133;A\x07\x02\x01\x1b]133;k;end_kitty\x07\x02bash-5.3$ \x01\x1b]133;k;start_suffix_kitty\x07\x02\x01\x1b[5 q\x02\x01\x1b]2;~/Projects/ghost.sh\x07\x02\x01\x1b]133;k;end_suffix_kitty\x07\x02";
+
+    // Visible width must be exactly 10 for "bash-5.3$ ", NOT 86
+    const vw = getVisibleWidth(kitty_ps1);
+    try std.testing.expectEqual(@as(usize, 10), vw);
+}
+
+test "skipNonPrinting with ST string terminator and CSI with modifiers" {
+    // OSC terminated with ST (\x1b\)
+    const osc_st = "\x1b]2;My Terminal Title\x1b\\user$ ";
+    try std.testing.expectEqual(@as(usize, 6), getVisibleWidth(osc_st));
+
+    // Kitty cursor shape escape \x1b[5 q
+    const cursor_shape = "\x1b[5 qhello";
+    try std.testing.expectEqual(@as(usize, 5), getVisibleWidth(cursor_shape));
+
+    // SGR colors
+    const colored = "\x1b[38;2;255;0;0mRED\x1b[0m";
+    try std.testing.expectEqual(@as(usize, 3), getVisibleWidth(colored));
+}
+
+test "renderEditor cursor column with Kitty prompt" {
+    const allocator = std.testing.allocator;
+    const term = try terminal.Term.init();
+    defer @constCast(&term).deinit();
+
+    const kitty_ps1 = "\x01\x1b]133;k;start_kitty\x07\x02\x01\x1b]133;D;0\x07\x1b]133;A\x07\x02\x01\x1b]133;k;end_kitty\x07\x02bash-5.3$ \x01\x1b]133;k;start_suffix_kitty\x07\x02\x01\x1b[5 q\x02\x01\x1b]2;~/Projects/ghost.sh\x07\x02\x01\x1b]133;k;end_suffix_kitty\x07\x02";
+
+    var ed = Editor.init(allocator, std.testing.io, std.process.Environ.empty, &term, kitty_ps1);
+    defer ed.deinit();
+
+    try renderEditor(&ed);
+
+    // Prompt visible width must be 10
+    try std.testing.expectEqual(@as(usize, 10), ed.prompt_vis_w);
+
+    // Cursor position in render buffer must move forward 10 columns, not 80+ columns
+    try std.testing.expect(std.mem.indexOf(u8, ed.render_buf.items, "\r\x1b[10C") != null);
+    try std.testing.expectEqual(@as(usize, 0), ed.rendered_cursor_row);
+    try std.testing.expectEqual(@as(usize, 1), ed.rendered_total_rows);
+}
+

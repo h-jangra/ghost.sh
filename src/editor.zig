@@ -296,20 +296,22 @@ pub const Editor = struct {
         const comp_prefix = input[0..start];
 
         // Check if completion_cache matches current command prefix
-        if (self.completion_cache.prefix) |cached_prefix| {
-            if (std.mem.eql(u8, cached_prefix, comp_prefix)) {
-                if (self.completion_cache.empty_token) |et| {
-                    if (std.mem.startsWith(u8, token, et)) return;
-                }
-                for (self.completion_cache.candidates.items) |cand| {
-                    const clean_cand = std.mem.trimEnd(u8, cand, " ");
-                    if (std.mem.startsWith(u8, clean_cand, token) and clean_cand.len > token.len) {
-                        self.ghost_buf.appendSlice(clean_cand[token.len..]) catch return;
-                        self.ghost_suggestion = self.ghost_buf.items;
-                        return;
+        // Paths with slashes change directory context, so avoid reusing a cache populated before the slash
+        if (std.mem.indexOfScalar(u8, token, '/') == null) {
+            if (self.completion_cache.prefix) |cached_prefix| {
+                if (std.mem.eql(u8, cached_prefix, comp_prefix)) {
+                    if (self.completion_cache.empty_token) |et| {
+                        if (std.mem.startsWith(u8, token, et)) return;
+                    }
+                    for (self.completion_cache.candidates.items) |cand| {
+                        const clean_cand = std.mem.trimEnd(u8, cand, " ");
+                        if (std.mem.startsWith(u8, clean_cand, token) and clean_cand.len > token.len) {
+                            self.ghost_buf.appendSlice(clean_cand[token.len..]) catch return;
+                            self.ghost_suggestion = self.ghost_buf.items;
+                            return;
+                        }
                     }
                 }
-                return;
             }
         }
 
@@ -350,26 +352,8 @@ pub const Editor = struct {
 
     pub fn collectCompletions(self: *Editor) void {
         self.clearCandidates();
-        self.comp_start_byte = completion.findCompletionStart(self.buffer.items, self.cursor_pos);
-        const comp_prefix = self.buffer.items[0..self.comp_start_byte];
-        const token = self.buffer.items[self.comp_start_byte..self.cursor_pos];
-
-        if (self.completion_cache.prefix) |cached_prefix| {
-            if (std.mem.eql(u8, cached_prefix, comp_prefix) and self.completion_cache.candidates.items.len > 0) {
-                for (self.completion_cache.candidates.items) |cand| {
-                    if (token.len == 0 or std.mem.startsWith(u8, cand, token)) {
-                        completion.addCandidate(self.allocator, &self.candidates, cand);
-                    }
-                }
-                if (self.candidates.items.len > 0) {
-                    self.max_candidate_width = render.getMaxCandidateWidth(self.candidates.items);
-                    return;
-                }
-            }
-        }
-
         self.completion_cache.clear();
-        self.completion_cache.prefix = self.allocator.dupe(u8, comp_prefix) catch null;
+        self.comp_start_byte = completion.findCompletionStart(self.buffer.items, self.cursor_pos);
 
         completion.collectCompletionsWithEnv(
             self.allocator,
@@ -380,10 +364,6 @@ pub const Editor = struct {
             self.buffer.items,
             self.cursor_pos,
         );
-
-        for (self.candidates.items) |cand| {
-            completion.addCandidate(self.allocator, &self.completion_cache.candidates, cand);
-        }
 
         self.max_candidate_width = render.getMaxCandidateWidth(self.candidates.items);
     }
@@ -902,6 +882,7 @@ pub const Editor = struct {
         if (add_space_if_file and cand.len > 0 and cand[cand.len - 1] != '/' and cand[cand.len - 1] != ' ' and cand[cand.len - 1] != '=') {
             self.insertSlice(" ") catch return;
         }
+        self.completion_cache.clear();
     }
 };
 
@@ -1090,5 +1071,88 @@ test "Editor completion cache hit and env var ghost suggestion" {
     editor.updateGhost();
     try std.testing.expect(editor.ghost_suggestion != null);
     try std.testing.expectEqualStrings("pletion.zig", editor.ghost_suggestion.?);
+}
+
+test "Editor consecutive tab completion on directory" {
+    const allocator = std.testing.allocator;
+    const term = try Term.init();
+    defer @constCast(&term).deinit();
+
+    var editor = Editor.init(allocator, std.testing.io, std.process.Environ.empty, &term, "> ");
+    defer editor.deinit();
+
+    // First tab completes 'cat sr' to 'cat src/'
+    try editor.buffer.appendSlice("cat sr");
+    editor.cursor_pos = editor.buffer.items.len;
+    editor.collectCompletions();
+    try std.testing.expectEqual(@as(usize, 1), editor.candidates.items.len);
+    try std.testing.expectEqualStrings("src/", editor.candidates.items[0]);
+    editor.applySelectedCompletion(true);
+    try std.testing.expectEqualStrings("cat src/", editor.buffer.items);
+
+    // Second tab on 'cat src/' must expand files inside src/
+    editor.collectCompletions();
+    // In src/ there are completion.zig, editor.zig, etc.
+    try std.testing.expect(editor.candidates.items.len > 1);
+    var found_completion = false;
+    for (editor.candidates.items) |cand| {
+        if (std.mem.indexOf(u8, cand, "completion.zig") != null) found_completion = true;
+    }
+    try std.testing.expect(found_completion);
+}
+
+test "Editor z command consecutive tab completion" {
+    const allocator = std.testing.allocator;
+    const term = try Term.init();
+    defer @constCast(&term).deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(std.testing.io, "config/nvim");
+    try tmp_dir.dir.createDirPath(std.testing.io, "config/mango");
+
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_len = try tmp_dir.dir.realPath(std.testing.io, &tmp_buf);
+    const tmp_path = tmp_buf[0..tmp_len];
+
+    // Set cwd to tmp_dir
+    var old_cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rc = posix.system.getcwd(&old_cwd_buf, old_cwd_buf.len);
+    const old_cwd = if (posix.errno(rc) == .SUCCESS) std.mem.sliceTo(&old_cwd_buf, 0) else ".";
+    defer {
+        var old_z: [std.fs.max_path_bytes:0]u8 = undefined;
+        if (completion.toCStr(&old_z, old_cwd)) |pz| {
+            _ = posix.system.chdir(pz.ptr);
+        }
+    }
+    var new_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    if (completion.toCStr(&new_z, tmp_path)) |pz| {
+        _ = posix.system.chdir(pz.ptr);
+    }
+
+    var editor = Editor.init(allocator, std.testing.io, std.process.Environ.empty, &term, "> ");
+    defer editor.deinit();
+
+    // First tab on 'z con' completes to 'z config/'
+    try editor.buffer.appendSlice("z con");
+    editor.cursor_pos = editor.buffer.items.len;
+    editor.collectCompletions();
+    try std.testing.expectEqual(@as(usize, 1), editor.candidates.items.len);
+    try std.testing.expectEqualStrings("config/", editor.candidates.items[0]);
+    editor.applySelectedCompletion(true);
+    try std.testing.expectEqualStrings("z config/", editor.buffer.items);
+
+    // Second tab on 'z config/' must find subdirectories inside config/
+    editor.collectCompletions();
+    try std.testing.expectEqual(@as(usize, 2), editor.candidates.items.len);
+    var found_nvim = false;
+    var found_mango = false;
+    for (editor.candidates.items) |c| {
+        if (std.mem.indexOf(u8, c, "nvim/") != null) found_nvim = true;
+        if (std.mem.indexOf(u8, c, "mango/") != null) found_mango = true;
+    }
+    try std.testing.expect(found_nvim);
+    try std.testing.expect(found_mango);
 }
 

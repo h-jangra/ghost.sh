@@ -893,13 +893,14 @@ fn collectZoxideCompletions(
             }
         }
 
+        var final_cand: []const u8 = cand;
+        var with_slash_buf: [4096]u8 = undefined;
         if (cand.len > 0 and cand[cand.len - 1] != '/') {
-            var with_slash_buf: [4096]u8 = undefined;
-            const with_slash = std.fmt.bufPrint(&with_slash_buf, "{s}/", .{cand}) catch continue;
-            addCandidate(allocator, candidates, with_slash);
-        } else {
-            addCandidate(allocator, candidates, cand);
+            final_cand = std.fmt.bufPrint(&with_slash_buf, "{s}/", .{cand}) catch continue;
         }
+
+        if (std.mem.eql(u8, final_cand, token)) continue;
+        addCandidate(allocator, candidates, final_cand);
     }
 }
 
