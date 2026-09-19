@@ -27,8 +27,10 @@ const BASH_COMPLETION_SCRIPT =
     \\read -ra words <<< "$cmd_pre"
     \\[[ "$cmd_pre" =~ [[:space:]]$ ]] && words+=("")
     \\cword=$(( ${#words[@]} - 1 ))
+    \\(( cword == 0 )) && exit 0
     \\cur="${words[cword]:-}"
     \\cmd="${words[0]:-}"
+    \\[[ -z "$cmd" ]] && exit 0
     \\prev=""
     \\(( cword > 0 )) && prev="${words[cword-1]}"
     \\
@@ -46,6 +48,7 @@ const BASH_COMPLETION_SCRIPT =
     \\        comp_spec=$(complete -p "$cmd" 2>/dev/null || complete -p "${cmd##*/}" 2>/dev/null)
     \\    fi
     \\fi
+    \\[[ -z "$comp_spec" ]] && exit 0
     \\
     \\raw=()
     \\if [[ "$comp_spec" =~ -F[[:space:]]+([^[:space:]]+) ]]; then
@@ -102,6 +105,18 @@ pub const COMMON_COMMANDS = [_][]const u8{
     "tail",       "tar",        "tee",        "touch",      "tree",
     "vi",         "vim",        "wc",         "which",      "zig",
 };
+
+pub const FILE_ORIENTED_COMMANDS = [_][]const u8{
+    "cat", "chmod", "chown", "cp", "head", "less", "ls", "more", "mv",
+    "nano", "nvim", "rm", "tail", "touch", "vi", "vim", "wc", "mkdir",
+};
+
+pub fn isFileOrientedCommand(cmd: []const u8) bool {
+    for (FILE_ORIENTED_COMMANDS) |fc| {
+        if (std.mem.eql(u8, cmd, fc)) return true;
+    }
+    return false;
+}
 
 pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
@@ -587,20 +602,20 @@ pub fn expandPathNative(
                 fn onEntry(c: @This(), entry: DirEntry) bool {
                     const name = entry.name;
                     if (name[0] != '.' or (c.seg.len > 0 and c.seg[0] == '.') or (c.seg.len == 0 and c.seg_idx == 0 and c.unescaped_path.len > 0 and c.unescaped_path[0] == '.')) {
-                        const is_dir = isDirEntry(c.fd_cast, name, entry.d_type);
-                        if (!c.dirs_only or !c.is_last or is_dir) {
-                            var match_score: ?u32 = null;
-                            if (c.seg.len == 0 or std.mem.eql(u8, name, c.seg)) {
-                                match_score = 0;
-                            } else if (std.ascii.startsWithIgnoreCase(name, c.seg)) {
-                                match_score = 1;
-                            } else if (containsIgnoreCase(name, c.seg)) {
-                                match_score = 2;
-                            } else if (fuzzyMatchIgnoreCase(name, c.seg)) {
-                                match_score = 3;
-                            }
+                        var match_score: ?u32 = null;
+                        if (c.seg.len == 0 or std.mem.eql(u8, name, c.seg)) {
+                            match_score = 0;
+                        } else if (std.ascii.startsWithIgnoreCase(name, c.seg)) {
+                            match_score = 1;
+                        } else if (containsIgnoreCase(name, c.seg)) {
+                            match_score = 2;
+                        } else if (fuzzyMatchIgnoreCase(name, c.seg)) {
+                            match_score = 3;
+                        }
 
-                            if (match_score) |ms| {
+                        if (match_score) |ms| {
+                            const is_dir = isDirEntry(c.fd_cast, name, entry.d_type);
+                            if (!c.dirs_only or !c.is_last or is_dir) {
                                 const total_score = c.item.score * 10 + ms;
                                 const next_disp = if (is_dir)
                                     std.fmt.allocPrint(c.a_alloc, "{s}{s}/", .{ c.item.disp_path, name }) catch return false
@@ -614,6 +629,7 @@ pub fn expandPathNative(
                                     .score = total_score,
                                     .is_dir = is_dir,
                                 }) catch return false;
+                                if (c.next_paths_ptr.items.len >= 100) return false;
                             }
                         }
                     }
@@ -636,6 +652,14 @@ pub fn expandPathNative(
 
         current_paths = next_paths;
         if (current_paths.items.len == 0) break;
+        if (current_paths.items.len > 50) {
+            std.mem.sort(PathCandidate, current_paths.items, {}, struct {
+                fn lessThan(_: void, p1: PathCandidate, p2: PathCandidate) bool {
+                    return p1.score < p2.score;
+                }
+            }.lessThan);
+            current_paths.items.len = 50;
+        }
     }
 
     std.mem.sort(PathCandidate, current_paths.items, {}, struct {
@@ -948,6 +972,23 @@ pub fn collectCompletionsWithEnv(
     {
         expandPathNative(allocator, environ, candidates, token, true);
         if (candidates.items.len > 0) return;
+    }
+
+    // If the token is an explicit relative/absolute/home path (e.g. ./, ../, ~/, /),
+    // resolve it directly using fast native path completion without spawning external shells.
+    if (token.len > 0 and (token[0] == '/' or token[0] == '~' or std.mem.startsWith(u8, token, "./") or std.mem.startsWith(u8, token, "../"))) {
+        expandPathNative(allocator, environ, candidates, token, false);
+        if (candidates.items.len > 0) return;
+    }
+
+    // Fast-path for common file-oriented tools (cat, vim, nano, less, rm, cp, mv, etc.)
+    // When completing a non-flag argument, native path completion is instantaneous and
+    // avoids spawning bash.
+    if (isFileOrientedCommand(pos_info.prefix)) {
+        if (token.len == 0 or token[0] != '-') {
+            expandPathNative(allocator, environ, candidates, token, false);
+            return;
+        }
     }
 
     collectBashCompletions(allocator, io, candidates, line, pt);

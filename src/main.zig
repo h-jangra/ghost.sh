@@ -17,6 +17,7 @@ fn cancelLine(editor: *Editor) void {
     editor.cursor_pos = 0;
     editor.hist_index = null;
     editor.ghost_suggestion = null;
+    editor.completion_cache.clear();
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -255,8 +256,10 @@ pub fn main(init: std.process.Init) !void {
 
         if (key != .alt_dot and key != .alt_underscore) editor.last_was_yank = false;
 
-        editor.updateGhost();
-        try render.renderEditor(&editor);
+        if (editor.in_completion or key == .tab or key == .shift_tab or key == .ctrl_c or key == .ctrl_l or !term.hasPendingInput()) {
+            editor.updateGhost();
+            try render.renderEditor(&editor);
+        }
     }
 
     if (accepted) {

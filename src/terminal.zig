@@ -123,4 +123,18 @@ pub const Term = struct {
         self.in_head = 1;
         return self.in_buf[0];
     }
+
+    pub fn hasPendingInput(self: *const Term) bool {
+        if (self.in_head < self.in_tail) return true;
+        var pfd = [1]posix.pollfd{.{ .fd = self.tty_fd, .events = posix.POLL.IN, .revents = 0 }};
+        const rc = posix.poll(&pfd, 0) catch return false;
+        return rc > 0;
+    }
 };
+
+test "Term hasPendingInput" {
+    const term = try Term.init();
+    defer @constCast(&term).deinit();
+    _ = term.hasPendingInput();
+}
+

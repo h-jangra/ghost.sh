@@ -50,6 +50,40 @@ pub fn deleteFile(path: []const u8) void {
     if (completion.toCStr(&path_z, path)) |pz| _ = posix.system.unlink(pz.ptr);
 }
 
+pub const CompletionCache = struct {
+    allocator: std.mem.Allocator,
+    prefix: ?[]u8 = null,
+    candidates: ArrayList([]const u8),
+    empty_token: ?[]u8 = null,
+
+    pub fn init(allocator: std.mem.Allocator) CompletionCache {
+        return .{
+            .allocator = allocator,
+            .prefix = null,
+            .candidates = ArrayList([]const u8).init(allocator),
+            .empty_token = null,
+        };
+    }
+
+    pub fn deinit(self: *CompletionCache) void {
+        self.clear();
+        self.candidates.deinit();
+    }
+
+    pub fn clear(self: *CompletionCache) void {
+        if (self.prefix) |p| {
+            self.allocator.free(p);
+            self.prefix = null;
+        }
+        if (self.empty_token) |t| {
+            self.allocator.free(t);
+            self.empty_token = null;
+        }
+        for (self.candidates.items) |c| self.allocator.free(c);
+        self.candidates.clearRetainingCapacity();
+    }
+};
+
 pub const Editor = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -69,6 +103,7 @@ pub const Editor = struct {
     ghost_suggestion: ?[]const u8 = null,
     ghost_buf: ArrayList(u8),
     command_cache: completion.CommandCache,
+    completion_cache: CompletionCache,
 
     in_completion: bool = false,
     candidates: ArrayList([]const u8),
@@ -107,6 +142,7 @@ pub const Editor = struct {
             .isearch_query = ArrayList(u8).init(allocator),
             .render_buf = ArrayList(u8).init(allocator),
             .command_cache = completion.CommandCache.init(allocator),
+            .completion_cache = CompletionCache.init(allocator),
             .ghost_buf = ArrayList(u8).init(allocator),
         };
         ed.buffer.ensureTotalCapacity(256) catch {};
@@ -128,6 +164,7 @@ pub const Editor = struct {
         self.isearch_query.deinit();
         self.render_buf.deinit();
         self.command_cache.deinit();
+        self.completion_cache.deinit();
         self.ghost_buf.deinit();
     }
 
@@ -234,30 +271,73 @@ pub const Editor = struct {
             return;
         }
 
-        var cands = ArrayList([]const u8).init(self.allocator);
-        defer {
-            for (cands.items) |c| self.allocator.free(c);
-            cands.deinit();
+        // Fast in-memory environment variable matching
+        const start = completion.findCompletionStart(input, self.cursor_pos);
+        const token = input[start..self.cursor_pos];
+        if (token.len > 0 and token[0] == '$') {
+            const var_prefix = token[1..];
+            const COMMON_ENV_VARS = [_][]const u8{
+                "HOME", "PATH", "USER", "SHELL", "TERM", "PWD", "EDITOR", "VISUAL", "LANG", "LC_ALL", "TMPDIR", "HOSTNAME", "LOGNAME", "SHLVL", "HISTFILE",
+            };
+            for (COMMON_ENV_VARS) |var_name| {
+                if (std.mem.startsWith(u8, var_name, var_prefix) and var_name.len > var_prefix.len) {
+                    if (completion.getEnv(self.environ, var_name) != null) {
+                        self.ghost_buf.appendSlice(var_name[var_prefix.len..]) catch return;
+                        self.ghost_suggestion = self.ghost_buf.items;
+                        return;
+                    }
+                }
+            }
         }
+
+        // If the terminal has pending keystrokes ready to read, skip expensive completion queries.
+        if (self.term.hasPendingInput()) return;
+
+        const comp_prefix = input[0..start];
+
+        // Check if completion_cache matches current command prefix
+        if (self.completion_cache.prefix) |cached_prefix| {
+            if (std.mem.eql(u8, cached_prefix, comp_prefix)) {
+                if (self.completion_cache.empty_token) |et| {
+                    if (std.mem.startsWith(u8, token, et)) return;
+                }
+                for (self.completion_cache.candidates.items) |cand| {
+                    const clean_cand = std.mem.trimEnd(u8, cand, " ");
+                    if (std.mem.startsWith(u8, clean_cand, token) and clean_cand.len > token.len) {
+                        self.ghost_buf.appendSlice(clean_cand[token.len..]) catch return;
+                        self.ghost_suggestion = self.ghost_buf.items;
+                        return;
+                    }
+                }
+                return;
+            }
+        }
+
+        // Cache miss: query completions and update cache
+        self.completion_cache.clear();
+        self.completion_cache.prefix = self.allocator.dupe(u8, comp_prefix) catch null;
+
         completion.collectCompletionsWithEnv(
             self.allocator,
             self.io,
             self.environ,
             &self.command_cache,
-            &cands,
+            &self.completion_cache.candidates,
             input,
             self.cursor_pos,
         );
 
-        if (cands.items.len > 0) {
-            const start = completion.findCompletionStart(input, self.cursor_pos);
-            const token = input[start..self.cursor_pos];
-            for (cands.items) |cand| {
-                if (std.mem.startsWith(u8, cand, token) and cand.len > token.len) {
-                    self.ghost_buf.appendSlice(cand[token.len..]) catch return;
-                    self.ghost_suggestion = self.ghost_buf.items;
-                    return;
-                }
+        if (self.completion_cache.candidates.items.len == 0) {
+            self.completion_cache.empty_token = self.allocator.dupe(u8, token) catch null;
+            return;
+        }
+
+        for (self.completion_cache.candidates.items) |cand| {
+            const clean_cand = std.mem.trimEnd(u8, cand, " ");
+            if (std.mem.startsWith(u8, clean_cand, token) and clean_cand.len > token.len) {
+                self.ghost_buf.appendSlice(clean_cand[token.len..]) catch return;
+                self.ghost_suggestion = self.ghost_buf.items;
+                return;
             }
         }
     }
@@ -271,6 +351,26 @@ pub const Editor = struct {
     pub fn collectCompletions(self: *Editor) void {
         self.clearCandidates();
         self.comp_start_byte = completion.findCompletionStart(self.buffer.items, self.cursor_pos);
+        const comp_prefix = self.buffer.items[0..self.comp_start_byte];
+        const token = self.buffer.items[self.comp_start_byte..self.cursor_pos];
+
+        if (self.completion_cache.prefix) |cached_prefix| {
+            if (std.mem.eql(u8, cached_prefix, comp_prefix) and self.completion_cache.candidates.items.len > 0) {
+                for (self.completion_cache.candidates.items) |cand| {
+                    if (token.len == 0 or std.mem.startsWith(u8, cand, token)) {
+                        completion.addCandidate(self.allocator, &self.candidates, cand);
+                    }
+                }
+                if (self.candidates.items.len > 0) {
+                    self.max_candidate_width = render.getMaxCandidateWidth(self.candidates.items);
+                    return;
+                }
+            }
+        }
+
+        self.completion_cache.clear();
+        self.completion_cache.prefix = self.allocator.dupe(u8, comp_prefix) catch null;
+
         completion.collectCompletionsWithEnv(
             self.allocator,
             self.io,
@@ -280,6 +380,11 @@ pub const Editor = struct {
             self.buffer.items,
             self.cursor_pos,
         );
+
+        for (self.candidates.items) |cand| {
+            completion.addCandidate(self.allocator, &self.completion_cache.candidates, cand);
+        }
+
         self.max_candidate_width = render.getMaxCandidateWidth(self.candidates.items);
     }
 
@@ -940,5 +1045,50 @@ test "Editor updateGhost completion fallback" {
 
     editor.acceptGhost();
     try std.testing.expect(std.mem.startsWith(u8, editor.buffer.items, "git add"));
+}
+
+test "Editor completion cache hit and env var ghost suggestion" {
+    const allocator = std.testing.allocator;
+    const term = try Term.init();
+    defer @constCast(&term).deinit();
+
+    var editor = Editor.init(allocator, std.testing.io, std.process.Environ.empty, &term, "> ");
+    defer editor.deinit();
+
+    // Test env var ghost suggestion
+    try editor.buffer.appendSlice("echo $HO");
+    editor.cursor_pos = editor.buffer.items.len;
+    editor.updateGhost();
+    try std.testing.expect(editor.ghost_suggestion != null);
+    try std.testing.expectEqualStrings("ME", editor.ghost_suggestion.?);
+
+    editor.buffer.clearRetainingCapacity();
+    editor.completion_cache.clear();
+
+    // First query populates cache
+    try editor.buffer.appendSlice("git ad");
+    editor.cursor_pos = editor.buffer.items.len;
+    editor.updateGhost();
+
+    try std.testing.expect(editor.completion_cache.prefix != null);
+    try std.testing.expectEqualStrings("git ", editor.completion_cache.prefix.?);
+    try std.testing.expect(editor.completion_cache.candidates.items.len > 0);
+
+    // Typing another character uses the populated cache without querying again
+    const old_cands_ptr = editor.completion_cache.candidates.items.ptr;
+    try editor.buffer.appendSlice("d");
+    editor.cursor_pos = editor.buffer.items.len;
+    editor.updateGhost();
+
+    // Cache pointer should remain identical (reused)
+    try std.testing.expectEqual(old_cands_ptr, editor.completion_cache.candidates.items.ptr);
+
+    // Changing prefix clears and updates cache
+    editor.buffer.clearRetainingCapacity();
+    try editor.buffer.appendSlice("cat src/com");
+    editor.cursor_pos = editor.buffer.items.len;
+    editor.updateGhost();
+    try std.testing.expect(editor.ghost_suggestion != null);
+    try std.testing.expectEqualStrings("pletion.zig", editor.ghost_suggestion.?);
 }
 
