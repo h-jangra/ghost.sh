@@ -193,7 +193,14 @@ pub fn main(init: std.process.Init) !void {
             .down => editor.historyDown(),
             .tab, .shift_tab => {
                 if (!editor.expandHistoryLine()) {
+                    // Quick UX feedback for potentially slow completions:
+                    // Show a subtle ellipsis if at end of buffer so user knows completion is resolving
+                    if (editor.cursor_pos == editor.buffer.items.len and editor.ghost_suggestion == null) {
+                        editor.ghost_suggestion = "…";
+                        render.renderEditor(&editor) catch {};
+                    }
                     editor.collectCompletions();
+                    editor.ghost_suggestion = null;
                     if (editor.candidates.items.len == 1) {
                         editor.selected_candidate = 0;
                         editor.applySelectedCompletion(true);

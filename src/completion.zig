@@ -111,6 +111,12 @@ pub const FILE_ORIENTED_COMMANDS = [_][]const u8{
     "nano", "nvim", "rm", "tail", "touch", "vi", "vim", "wc", "mkdir",
 };
 
+pub const COMMON_GIT_SUBCOMMANDS = [_][]const u8{
+    "add", "branch", "checkout", "clone", "commit", "diff", "fetch",
+    "init", "log", "merge", "pull", "push", "rebase", "reset", "restore",
+    "revert", "show", "stash", "status", "switch", "tag",
+};
+
 pub fn isFileOrientedCommand(cmd: []const u8) bool {
     for (FILE_ORIENTED_COMMANDS) |fc| {
         if (std.mem.eql(u8, cmd, fc)) return true;
@@ -174,7 +180,12 @@ pub fn getProcEnviron(key: []const u8, out_buf: []u8) ?[]const u8 {
 }
 
 pub fn getEnv(env_obj: std.process.Environ, key: []const u8) ?[]const u8 {
-    return env_obj.getPosix(key);
+    if (env_obj.getPosix(key)) |val| return val;
+    // Static thread-local buffer for fallback read from procfs
+    const S = struct {
+        threadlocal var proc_buf: [4096]u8 = undefined;
+    };
+    return getProcEnviron(key, &S.proc_buf);
 }
 
 pub const DirEntry = struct {
@@ -598,8 +609,15 @@ pub fn expandPathNative(
                 is_last: bool,
                 a_alloc: std.mem.Allocator,
                 next_paths_ptr: *std.array_list.AlignedManaged(PathCandidate, null),
+                entries_scanned: usize = 0,
+                stat_calls: usize = 0,
 
-                fn onEntry(c: @This(), entry: DirEntry) bool {
+                fn onEntry(c: *@This(), entry: DirEntry) bool {
+                    // Hard cap: stop scanning after 2000 entries in a single directory.
+                    // This prevents multi-second hangs in huge directories (e.g. 1.6G asset folders).
+                    c.entries_scanned += 1;
+                    if (c.entries_scanned > 2000) return false;
+
                     const name = entry.name;
                     if (name[0] != '.' or (c.seg.len > 0 and c.seg[0] == '.') or (c.seg.len == 0 and c.seg_idx == 0 and c.unescaped_path.len > 0 and c.unescaped_path[0] == '.')) {
                         var match_score: ?u32 = null;
@@ -614,7 +632,23 @@ pub fn expandPathNative(
                         }
 
                         if (match_score) |ms| {
-                            const is_dir = isDirEntry(c.fd_cast, name, entry.d_type);
+                            // Avoid excessive stat calls for unknown d_type entries in large dirs.
+                            // Cap stat calls per directory to prevent syscall overhead in huge dirs.
+                            var is_dir: bool = undefined;
+                            if (entry.d_type == 4) {
+                                is_dir = true;
+                            } else if (entry.d_type == 8) {
+                                is_dir = false;
+                            } else {
+                                // d_type == 0 or d_type == 10 (symlink): must stat
+                                c.stat_calls += 1;
+                                if (c.stat_calls > 200) {
+                                    // Too many unknown entries — assume regular file to avoid stalling
+                                    is_dir = false;
+                                } else {
+                                    is_dir = isDirEntry(c.fd_cast, name, entry.d_type);
+                                }
+                            }
                             if (!c.dirs_only or !c.is_last or is_dir) {
                                 const total_score = c.item.score * 10 + ms;
                                 const next_disp = if (is_dir)
@@ -637,7 +671,7 @@ pub fn expandPathNative(
                 }
             };
 
-            iterateDir(@intCast(fd), &dent_buf, ScanCtx{
+            var scan_ctx = ScanCtx{
                 .fd_cast = @intCast(fd),
                 .item = item,
                 .seg = seg,
@@ -647,7 +681,8 @@ pub fn expandPathNative(
                 .is_last = is_last,
                 .a_alloc = a,
                 .next_paths_ptr = &next_paths,
-            }, ScanCtx.onEntry);
+            };
+            iterateDir(@intCast(fd), &dent_buf, &scan_ctx, ScanCtx.onEntry);
         }
 
         current_paths = next_paths;
@@ -716,8 +751,13 @@ pub fn findPathMatch(environ: std.process.Environ, raw_path: []const u8, result_
         best_match_len: usize = 0,
         best_match_is_dir: bool = false,
         exact_prefix_found: bool = false,
+        entries_scanned: usize = 0,
+        stat_calls: usize = 0,
 
         fn onEntry(c: *@This(), entry: DirEntry) bool {
+            c.entries_scanned += 1;
+            if (c.entries_scanned > 2000) return false;
+
             const name = entry.name;
             if (name[0] != '.' or (c.file_prefix.len > 0 and c.file_prefix[0] == '.')) {
                 var matches = false;
@@ -730,7 +770,20 @@ pub fn findPathMatch(environ: std.process.Environ, raw_path: []const u8, result_
                 }
 
                 if (matches) {
-                    const is_dir = isDirEntry(c.fd_cast, name, entry.d_type);
+                    var is_dir: bool = undefined;
+                    if (entry.d_type == 4) {
+                        is_dir = true;
+                    } else if (entry.d_type == 8) {
+                        is_dir = false;
+                    } else {
+                        c.stat_calls += 1;
+                        if (c.stat_calls > 200) {
+                            is_dir = false;
+                        } else {
+                            is_dir = isDirEntry(c.fd_cast, name, entry.d_type);
+                        }
+                    }
+
                     if (is_exact and !c.exact_prefix_found) {
                         c.exact_prefix_found = true;
                         c.best_match_len = @min(name.len, c.best_match_buf.len);
@@ -818,16 +871,72 @@ pub fn collectBashCompletions(
     var pt_buf: [32]u8 = undefined;
     const pt_str = std.fmt.bufPrint(&pt_buf, "{d}", .{pt}) catch return;
 
-    const res = std.process.run(allocator, io, .{
+    // Spawn bash with piped stdout so we can apply a wall-clock timeout.
+    // Slow completion scripts (ansible, kubectl, terraform, etc.) can stall
+    // for many seconds. A 2-second deadline keeps the shell responsive.
+    var child = std.process.spawn(io, .{
         .argv = &[_][]const u8{ "bash", "--norc", "-c", BASH_COMPLETION_SCRIPT, "_", line, pt_str },
-        .stdout_limit = std.Io.Limit.limited(128 * 1024),
-    }) catch return;
-    defer allocator.free(res.stdout);
-    defer allocator.free(res.stderr);
+        .stdin = .close,
+        .stdout = .pipe,
+        .stderr = .close,
+    }) catch {
+        // spawn not available or bash missing — fall back to simple blocking run
+        const res = std.process.run(allocator, io, .{
+            .argv = &[_][]const u8{ "bash", "--norc", "-c", BASH_COMPLETION_SCRIPT, "_", line, pt_str },
+            .stdout_limit = std.Io.Limit.limited(128 * 1024),
+        }) catch return;
+        defer allocator.free(res.stdout);
+        defer allocator.free(res.stderr);
+        if (res.term != .exited or res.term.exited != 0) return;
+        var it2 = std.mem.splitScalar(u8, res.stdout, '\n');
+        while (it2.next()) |raw_line| {
+            const cand = std.mem.trimEnd(u8, raw_line, "\r");
+            if (cand.len > 0) addCandidate(allocator, candidates, cand);
+        }
+        return;
+    };
 
-    if (res.term != .exited or res.term.exited != 0) return;
+    var out_list = std.array_list.AlignedManaged(u8, null).init(allocator);
+    defer out_list.deinit();
 
-    var it = std.mem.splitScalar(u8, res.stdout, '\n');
+    var timed_out = false;
+    if (child.stdout) |stdout_file| {
+        const stdout_fd: posix.fd_t = stdout_file.handle;
+        var buf: [4096]u8 = undefined;
+        // Poll in a loop; remaining_ms decrements by a fixed step each iteration.
+        // Total budget: 2000 ms.
+        var remaining_ms: i32 = 2000;
+
+        while (remaining_ms > 0 and out_list.items.len < 128 * 1024) {
+            var pfd = [1]posix.pollfd{.{ .fd = stdout_fd, .events = posix.POLL.IN, .revents = 0 }};
+            const poll_rc = posix.poll(&pfd, remaining_ms) catch break;
+            if (poll_rc <= 0) {
+                timed_out = (poll_rc == 0); // 0 == timeout, negative == error
+                break;
+            }
+            remaining_ms -= 50; // charge a small decrement per round-trip
+            if (remaining_ms < 0) remaining_ms = 0;
+            const rc = posix.system.read(stdout_fd, &buf, buf.len);
+            if (posix.errno(rc) != .SUCCESS or rc == 0) break;
+            out_list.appendSlice(buf[0..@intCast(rc)]) catch break;
+        }
+
+        _ = posix.system.close(stdout_fd);
+        child.stdout = null;
+    }
+
+    if (timed_out) {
+        // Kill the bash subprocess so it doesn't linger
+        if (child.id) |pid| _ = posix.system.kill(pid, posix.SIG.KILL);
+        _ = child.wait(io) catch {};
+        return;
+    }
+
+    _ = child.wait(io) catch {};
+
+    if (out_list.items.len == 0) return;
+
+    var it = std.mem.splitScalar(u8, out_list.items, '\n');
     while (it.next()) |raw_line| {
         const cand = std.mem.trimEnd(u8, raw_line, "\r");
         if (cand.len > 0) addCandidate(allocator, candidates, cand);
@@ -995,6 +1104,98 @@ pub fn collectCompletionsWithEnv(
     collectBashCompletions(allocator, io, candidates, line, pt);
     if (candidates.items.len > 0) return;
 
+    expandPathNative(allocator, environ, candidates, token, false);
+}
+
+/// Like collectCompletionsWithEnv but never spawns any subprocess.
+/// Used by updateGhost to provide instant inline suggestions without stalling
+/// on slow bash completion scripts or zoxide queries.
+pub fn collectCompletionsNativeOnly(
+    allocator: std.mem.Allocator,
+    environ: std.process.Environ,
+    command_cache_opt: ?*const CommandCache,
+    candidates: *std.array_list.AlignedManaged([]const u8, null),
+    line: []const u8,
+    cursor_pos: usize,
+) void {
+    const pt = @min(cursor_pos, line.len);
+    const start = findCompletionStart(line, pt);
+    const token = line[start..pt];
+    const prefix = line[0..pt];
+
+    if (token.len > 0 and token[0] == '$') {
+        const var_prefix = token[1..];
+        const COMMON_ENV_VARS = [_][]const u8{
+            "HOME", "PATH", "USER", "SHELL", "TERM", "PWD", "EDITOR", "VISUAL", "LANG", "LC_ALL", "TMPDIR", "HOSTNAME", "LOGNAME", "SHLVL", "HISTFILE",
+        };
+        for (COMMON_ENV_VARS) |var_name| {
+            if (std.mem.startsWith(u8, var_name, var_prefix) or std.ascii.startsWithIgnoreCase(var_name, var_prefix)) {
+                if (getEnv(environ, var_name) != null) {
+                    var var_buf: [256]u8 = undefined;
+                    const full_var = std.fmt.bufPrint(&var_buf, "${s}", .{var_name}) catch continue;
+                    addCandidate(allocator, candidates, full_var);
+                }
+            }
+        }
+        if (candidates.items.len > 0) return;
+    }
+
+    const pos_info = getCommandPositionInfo(prefix);
+
+    if (pos_info.is_command_position) {
+        if (token.len > 0 and (token[0] == '.' or token[0] == '/' or token[0] == '~')) {
+            expandPathNative(allocator, environ, candidates, token, false);
+            if (candidates.items.len > 0) return;
+        } else {
+            for (BUILTINS_AND_KEYWORDS) |kw| {
+                if (std.mem.startsWith(u8, kw, token)) addCandidate(allocator, candidates, kw);
+            }
+            if (command_cache_opt) |cc| {
+                const idx = std.sort.lowerBound([]const u8, cc.commands.items, token, comparePrefix);
+                var i = idx;
+                while (i < cc.commands.items.len) : (i += 1) {
+                    const cmd = cc.commands.items[i];
+                    if (!std.mem.startsWith(u8, cmd, token)) break;
+                    addCandidate(allocator, candidates, cmd);
+                }
+            }
+            if (candidates.items.len > 0) return;
+        }
+    }
+
+    if (std.mem.eql(u8, pos_info.prefix, "cd") or
+        std.mem.eql(u8, pos_info.prefix, "pushd") or
+        std.mem.eql(u8, pos_info.prefix, "rmdir") or
+        std.mem.eql(u8, pos_info.prefix, "builtin cd"))
+    {
+        expandPathNative(allocator, environ, candidates, token, true);
+        if (candidates.items.len > 0) return;
+    }
+
+    if (token.len > 0 and (token[0] == '/' or token[0] == '~' or std.mem.startsWith(u8, token, "./") or std.mem.startsWith(u8, token, "../"))) {
+        expandPathNative(allocator, environ, candidates, token, false);
+        if (candidates.items.len > 0) return;
+    }
+
+    if (isFileOrientedCommand(pos_info.prefix)) {
+        if (token.len == 0 or token[0] != '-') {
+            expandPathNative(allocator, environ, candidates, token, false);
+            return;
+        }
+    }
+
+    if (std.mem.eql(u8, pos_info.prefix, "git")) {
+        for (COMMON_GIT_SUBCOMMANDS) |sc| {
+            if (std.mem.startsWith(u8, sc, token)) {
+                var sc_buf: [64]u8 = undefined;
+                const with_space = std.fmt.bufPrint(&sc_buf, "{s} ", .{sc}) catch sc;
+                addCandidate(allocator, candidates, with_space);
+            }
+        }
+        if (candidates.items.len > 0) return;
+    }
+
+    // Native-only: do a best-effort path expansion as last resort (no subprocess)
     expandPathNative(allocator, environ, candidates, token, false);
 }
 

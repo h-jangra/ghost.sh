@@ -315,13 +315,13 @@ pub const Editor = struct {
             }
         }
 
-        // Cache miss: query completions and update cache
+        // Cache miss: query completions using native-only paths (no subprocess spawning).
+        // Ghost suggestions must be instantaneous; Tab-press will still use full bash completions.
         self.completion_cache.clear();
         self.completion_cache.prefix = self.allocator.dupe(u8, comp_prefix) catch null;
 
-        completion.collectCompletionsWithEnv(
+        completion.collectCompletionsNativeOnly(
             self.allocator,
-            self.io,
             self.environ,
             &self.command_cache,
             &self.completion_cache.candidates,
