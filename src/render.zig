@@ -348,21 +348,20 @@ pub fn renderEditor(editor: *Editor) !void {
     const ws = editor.term.getWindowSize();
     const term_cols: usize = if (ws.cols > 0) ws.cols else 80;
 
-    // Hide cursor while rendering
+    // Hide cursor during redraw
     try buf.appendSlice("\x1b[?25l");
 
-    // If first render, output prefix of multi-line prompt if any
     if (editor.first_render and editor.prompt_prefix.len > 0) {
         try appendBufferWithCrlf(buf, editor.prompt_prefix);
     }
 
-    // Step 1: Move from previous cursor position back to prompt origin (Row 0, Col 0)
+    // Move back up to the prompt origin
     if (!editor.first_render and editor.rendered_cursor_row > 0) {
         try appendFmt(buf, "\x1b[{d}A", .{editor.rendered_cursor_row});
     }
     try buf.appendSlice("\r");
 
-    // Step 2: Clear all previously rendered rows
+    // Clear previously rendered rows
     const old_rows = if (editor.first_render) 0 else (editor.rendered_total_rows + editor.rendered_menu_rows);
     if (old_rows > 1) {
         try buf.appendSlice("\x1b[2K");
@@ -532,7 +531,6 @@ test "renderEditor with and without ghost suggestion" {
 }
 
 test "calculateLayout single line and multi line" {
-    // Single line
     const l1 = calculateLayout(2, "hello", 5, null, 80);
     try std.testing.expectEqual(@as(usize, 0), l1.cursor_row);
     try std.testing.expectEqual(@as(usize, 7), l1.cursor_col);
@@ -540,7 +538,6 @@ test "calculateLayout single line and multi line" {
     try std.testing.expectEqual(@as(usize, 7), l1.end_col);
     try std.testing.expectEqual(@as(usize, 1), l1.total_rows);
 
-    // Multi line with \n
     const multiline = "line1\nline2\nline3";
     const l2 = calculateLayout(2, multiline, multiline.len, null, 80);
     try std.testing.expectEqual(@as(usize, 2), l2.cursor_row);
@@ -549,7 +546,6 @@ test "calculateLayout single line and multi line" {
     try std.testing.expectEqual(@as(usize, 5), l2.end_col);
     try std.testing.expectEqual(@as(usize, 3), l2.total_rows);
 
-    // Cursor in the middle of multiline
     const l3 = calculateLayout(2, multiline, 2, null, 80);
     try std.testing.expectEqual(@as(usize, 0), l3.cursor_row);
     try std.testing.expectEqual(@as(usize, 4), l3.cursor_col); // prompt 2 + "li" (2)
@@ -558,7 +554,6 @@ test "calculateLayout single line and multi line" {
 }
 
 test "calculateLayout wrapping on terminal width" {
-    // 10 cols, prompt width 2, command 15 'a's
     const text = "aaaaaaaaaaaaaaa";
     // Cursor at index 3: row 0, col 5 (2 + 3)
     const l1 = calculateLayout(2, text, 3, null, 10);
@@ -567,7 +562,6 @@ test "calculateLayout wrapping on terminal width" {
     try std.testing.expectEqual(@as(usize, 1), l1.end_row);
     try std.testing.expectEqual(@as(usize, 2), l1.total_rows);
 
-    // With ghost suggestion that wraps into row 2
     const ghost = "bbbbbbbbbb";
     const l2 = calculateLayout(2, text, 3, ghost, 10);
     try std.testing.expectEqual(@as(usize, 0), l2.cursor_row);
@@ -587,38 +581,32 @@ test "renderEditor multi-line clean redraw without duplication" {
     try ed.buffer.appendSlice("first line\nsecond line");
     ed.cursor_pos = ed.buffer.items.len;
 
-    // Render 1
     try renderEditor(&ed);
     try std.testing.expectEqual(@as(usize, 1), ed.rendered_cursor_row);
     try std.testing.expectEqual(@as(usize, 2), ed.rendered_total_rows);
 
-    // Render 2 (simulating next event / keystroke)
     try renderEditor(&ed);
-    // Verifying it moved up 1 line (\x1b[1A) and cleared 2 rows (\x1b[2K...\x1b[B\x1b[2K)
+    // Redraw: move up 1 line (\x1b[1A) and clear 2 rows (\x1b[2K...\x1b[B\x1b[2K)
     try std.testing.expect(std.mem.indexOf(u8, ed.render_buf.items, "\x1b[1A\r\x1b[2K\x1b[B\x1b[2K\x1b[1A\r") != null);
     try std.testing.expectEqual(@as(usize, 1), ed.rendered_cursor_row);
     try std.testing.expectEqual(@as(usize, 2), ed.rendered_total_rows);
 }
 
 test "skipNonPrinting and getVisibleWidth with Kitty shell integration" {
-    // Exact Kitty PS1 expanded string from bash with kitty shell integration
+    // Real Kitty PS1 from bash shell integration
     const kitty_ps1 = "\x01\x1b]133;k;start_kitty\x07\x02\x01\x1b]133;D;0\x07\x1b]133;A\x07\x02\x01\x1b]133;k;end_kitty\x07\x02bash-5.3$ \x01\x1b]133;k;start_suffix_kitty\x07\x02\x01\x1b[5 q\x02\x01\x1b]2;~/Projects/ghost.sh\x07\x02\x01\x1b]133;k;end_suffix_kitty\x07\x02";
 
-    // Visible width must be exactly 10 for "bash-5.3$ ", NOT 86
     const vw = getVisibleWidth(kitty_ps1);
     try std.testing.expectEqual(@as(usize, 10), vw);
 }
 
 test "skipNonPrinting with ST string terminator and CSI with modifiers" {
-    // OSC terminated with ST (\x1b\)
     const osc_st = "\x1b]2;My Terminal Title\x1b\\user$ ";
     try std.testing.expectEqual(@as(usize, 6), getVisibleWidth(osc_st));
 
-    // Kitty cursor shape escape \x1b[5 q
     const cursor_shape = "\x1b[5 qhello";
     try std.testing.expectEqual(@as(usize, 5), getVisibleWidth(cursor_shape));
 
-    // SGR colors
     const colored = "\x1b[38;2;255;0;0mRED\x1b[0m";
     try std.testing.expectEqual(@as(usize, 3), getVisibleWidth(colored));
 }
@@ -635,10 +623,8 @@ test "renderEditor cursor column with Kitty prompt" {
 
     try renderEditor(&ed);
 
-    // Prompt visible width must be 10
     try std.testing.expectEqual(@as(usize, 10), ed.prompt_vis_w);
 
-    // Cursor position in render buffer must move forward 10 columns, not 80+ columns
     try std.testing.expect(std.mem.indexOf(u8, ed.render_buf.items, "\r\x1b[10C") != null);
     try std.testing.expectEqual(@as(usize, 0), ed.rendered_cursor_row);
     try std.testing.expectEqual(@as(usize, 1), ed.rendered_total_rows);

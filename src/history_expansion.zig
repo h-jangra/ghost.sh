@@ -57,31 +57,6 @@ pub fn getLastArg(allocator: std.mem.Allocator, cmd: []const u8) !?[]const u8 {
     return try allocator.dupe(u8, words.items[words.items.len - 1]);
 }
 
-pub fn getFirstArg(allocator: std.mem.Allocator, cmd: []const u8) !?[]const u8 {
-    var words = try splitWords(allocator, cmd);
-    defer words.deinit();
-    if (words.items.len < 2) {
-        if (words.items.len == 1) return try allocator.dupe(u8, words.items[0]);
-        return null;
-    }
-    return try allocator.dupe(u8, words.items[1]);
-}
-
-pub fn getAllArgs(allocator: std.mem.Allocator, cmd: []const u8) !?[]const u8 {
-    var words = try splitWords(allocator, cmd);
-    defer words.deinit();
-    if (words.items.len <= 1) return try allocator.dupe(u8, "");
-
-    var list = ArrayList(u8).init(allocator);
-    defer list.deinit();
-
-    for (words.items[1..], 0..) |w, idx| {
-        if (idx > 0) try list.append(' ');
-        try list.appendSlice(w);
-    }
-    return try list.toOwnedSlice();
-}
-
 fn applyModifier(allocator: std.mem.Allocator, str: []const u8, mod: []const u8) !struct { res: []const u8, print_only: bool, err_msg: ?[]const u8 } {
     if (mod.len == 0) return .{ .res = try allocator.dupe(u8, str), .print_only = false, .err_msg = null };
 

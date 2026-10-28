@@ -181,8 +181,7 @@ pub fn getProcEnviron(key: []const u8, out_buf: []u8) ?[]const u8 {
 
 pub fn getEnv(env_obj: std.process.Environ, key: []const u8) ?[]const u8 {
     if (env_obj.getPosix(key)) |val| return val;
-    // Static thread-local buffer for fallback read from procfs
-    const S = struct {
+    const S = struct { // threadlocal buffer for the procfs fallback
         threadlocal var proc_buf: [4096]u8 = undefined;
     };
     return getProcEnviron(key, &S.proc_buf);
@@ -613,8 +612,7 @@ pub fn expandPathNative(
                 stat_calls: usize = 0,
 
                 fn onEntry(c: *@This(), entry: DirEntry) bool {
-                    // Hard cap: stop scanning after 2000 entries in a single directory.
-                    // This prevents multi-second hangs in huge directories (e.g. 1.6G asset folders).
+                    // Hard cap per directory to prevent stalls in huge dirs.
                     c.entries_scanned += 1;
                     if (c.entries_scanned > 2000) return false;
 
@@ -632,18 +630,17 @@ pub fn expandPathNative(
                         }
 
                         if (match_score) |ms| {
-                            // Avoid excessive stat calls for unknown d_type entries in large dirs.
-                            // Cap stat calls per directory to prevent syscall overhead in huge dirs.
+                            // Cap stat calls to bound syscall overhead in huge dirs.
                             var is_dir: bool = undefined;
                             if (entry.d_type == 4) {
                                 is_dir = true;
                             } else if (entry.d_type == 8) {
                                 is_dir = false;
                             } else {
-                                // d_type == 0 or d_type == 10 (symlink): must stat
+                                // d_type 0 (unknown) or 10 (symlink) requires stat
                                 c.stat_calls += 1;
                                 if (c.stat_calls > 200) {
-                                    // Too many unknown entries — assume regular file to avoid stalling
+                                    // Over stat budget: assume regular file
                                     is_dir = false;
                                 } else {
                                     is_dir = isDirEntry(c.fd_cast, name, entry.d_type);
@@ -871,16 +868,14 @@ pub fn collectBashCompletions(
     var pt_buf: [32]u8 = undefined;
     const pt_str = std.fmt.bufPrint(&pt_buf, "{d}", .{pt}) catch return;
 
-    // Spawn bash with piped stdout so we can apply a wall-clock timeout.
-    // Slow completion scripts (ansible, kubectl, terraform, etc.) can stall
-    // for many seconds. A 2-second deadline keeps the shell responsive.
+    // Piped stdout + wall-clock timeout so slow completion scripts can't stall the shell.
     var child = std.process.spawn(io, .{
         .argv = &[_][]const u8{ "bash", "--norc", "-c", BASH_COMPLETION_SCRIPT, "_", line, pt_str },
         .stdin = .close,
         .stdout = .pipe,
         .stderr = .close,
     }) catch {
-        // spawn not available or bash missing — fall back to simple blocking run
+        // bash spawn unavailable: fall back to a blocking run
         const res = std.process.run(allocator, io, .{
             .argv = &[_][]const u8{ "bash", "--norc", "-c", BASH_COMPLETION_SCRIPT, "_", line, pt_str },
             .stdout_limit = std.Io.Limit.limited(128 * 1024),
@@ -903,8 +898,6 @@ pub fn collectBashCompletions(
     if (child.stdout) |stdout_file| {
         const stdout_fd: posix.fd_t = stdout_file.handle;
         var buf: [4096]u8 = undefined;
-        // Poll in a loop; remaining_ms decrements by a fixed step each iteration.
-        // Total budget: 2000 ms.
         var remaining_ms: i32 = 2000;
 
         while (remaining_ms > 0 and out_list.items.len < 128 * 1024) {
@@ -914,7 +907,7 @@ pub fn collectBashCompletions(
                 timed_out = (poll_rc == 0); // 0 == timeout, negative == error
                 break;
             }
-            remaining_ms -= 50; // charge a small decrement per round-trip
+            remaining_ms -= 50; // debit per round-trip to bound wall time
             if (remaining_ms < 0) remaining_ms = 0;
             const rc = posix.system.read(stdout_fd, &buf, buf.len);
             if (posix.errno(rc) != .SUCCESS or rc == 0) break;
@@ -926,7 +919,6 @@ pub fn collectBashCompletions(
     }
 
     if (timed_out) {
-        // Kill the bash subprocess so it doesn't linger
         if (child.id) |pid| _ = posix.system.kill(pid, posix.SIG.KILL);
         _ = child.wait(io) catch {};
         return;
@@ -982,7 +974,7 @@ fn collectZoxideCompletions(
         var cand_buf: [4096]u8 = undefined;
         var cand: []const u8 = line;
 
-        // If inside current working directory, show path relative to pwd
+        // Show path relative to pwd when possible
         if (pwd_opt) |pwd| {
             if (std.mem.startsWith(u8, line, pwd) and line.len > pwd.len) {
                 const rel = line[pwd.len..];
@@ -1084,16 +1076,13 @@ pub fn collectCompletionsWithEnv(
         if (candidates.items.len > 0) return;
     }
 
-    // If the token is an explicit relative/absolute/home path (e.g. ./, ../, ~/, /),
-    // resolve it directly using fast native path completion without spawning external shells.
+    // Explicit path tokens (./, ../, ~/, /) resolve via fast native path completion
     if (token.len > 0 and (token[0] == '/' or token[0] == '~' or std.mem.startsWith(u8, token, "./") or std.mem.startsWith(u8, token, "../"))) {
         expandPathNative(allocator, environ, candidates, token, false);
         if (candidates.items.len > 0) return;
     }
 
-    // Fast-path for common file-oriented tools (cat, vim, nano, less, rm, cp, mv, etc.)
-    // When completing a non-flag argument, native path completion is instantaneous and
-    // avoids spawning bash.
+    // Fast-path for file-oriented commands: native path completion avoids spawning bash
     if (isFileOrientedCommand(pos_info.prefix)) {
         if (token.len == 0 or token[0] != '-') {
             expandPathNative(allocator, environ, candidates, token, false);
@@ -1107,9 +1096,8 @@ pub fn collectCompletionsWithEnv(
     expandPathNative(allocator, environ, candidates, token, false);
 }
 
-/// Like collectCompletionsWithEnv but never spawns any subprocess.
-/// Used by updateGhost to provide instant inline suggestions without stalling
-/// on slow bash completion scripts or zoxide queries.
+/// Like collectCompletionsWithEnv but never spawns a subprocess;
+/// used by updateGhost for instant inline suggestions.
 pub fn collectCompletionsNativeOnly(
     allocator: std.mem.Allocator,
     environ: std.process.Environ,
@@ -1195,7 +1183,7 @@ pub fn collectCompletionsNativeOnly(
         if (candidates.items.len > 0) return;
     }
 
-    // Native-only: do a best-effort path expansion as last resort (no subprocess)
+    // Last resort: best-effort path expansion (no subprocess)
     expandPathNative(allocator, environ, candidates, token, false);
 }
 

@@ -271,7 +271,6 @@ pub const Editor = struct {
             return;
         }
 
-        // Fast in-memory environment variable matching
         const start = completion.findCompletionStart(input, self.cursor_pos);
         const token = input[start..self.cursor_pos];
         if (token.len > 0 and token[0] == '$') {
@@ -290,13 +289,12 @@ pub const Editor = struct {
             }
         }
 
-        // If the terminal has pending keystrokes ready to read, skip expensive completion queries.
+        // Skip expensive queries while more keystrokes are pending
         if (self.term.hasPendingInput()) return;
 
         const comp_prefix = input[0..start];
 
-        // Check if completion_cache matches current command prefix
-        // Paths with slashes change directory context, so avoid reusing a cache populated before the slash
+        // Reuse cache when the prefix matches; slashes change dir context
         if (std.mem.indexOfScalar(u8, token, '/') == null) {
             if (self.completion_cache.prefix) |cached_prefix| {
                 if (std.mem.eql(u8, cached_prefix, comp_prefix)) {
@@ -315,8 +313,7 @@ pub const Editor = struct {
             }
         }
 
-        // Cache miss: query completions using native-only paths (no subprocess spawning).
-        // Ghost suggestions must be instantaneous; Tab-press will still use full bash completions.
+        // Cache miss: native-only query (no subprocess); Tab still uses full bash completions
         self.completion_cache.clear();
         self.completion_cache.prefix = self.allocator.dupe(u8, comp_prefix) catch null;
 
@@ -1036,7 +1033,6 @@ test "Editor completion cache hit and env var ghost suggestion" {
     var editor = Editor.init(allocator, std.testing.io, std.process.Environ.empty, &term, "> ");
     defer editor.deinit();
 
-    // Test env var ghost suggestion
     try editor.buffer.appendSlice("echo $HO");
     editor.cursor_pos = editor.buffer.items.len;
     editor.updateGhost();
@@ -1046,7 +1042,6 @@ test "Editor completion cache hit and env var ghost suggestion" {
     editor.buffer.clearRetainingCapacity();
     editor.completion_cache.clear();
 
-    // First query populates cache
     try editor.buffer.appendSlice("git ad");
     editor.cursor_pos = editor.buffer.items.len;
     editor.updateGhost();
@@ -1055,16 +1050,13 @@ test "Editor completion cache hit and env var ghost suggestion" {
     try std.testing.expectEqualStrings("git ", editor.completion_cache.prefix.?);
     try std.testing.expect(editor.completion_cache.candidates.items.len > 0);
 
-    // Typing another character uses the populated cache without querying again
     const old_cands_ptr = editor.completion_cache.candidates.items.ptr;
     try editor.buffer.appendSlice("d");
     editor.cursor_pos = editor.buffer.items.len;
     editor.updateGhost();
 
-    // Cache pointer should remain identical (reused)
     try std.testing.expectEqual(old_cands_ptr, editor.completion_cache.candidates.items.ptr);
 
-    // Changing prefix clears and updates cache
     editor.buffer.clearRetainingCapacity();
     try editor.buffer.appendSlice("cat src/com");
     editor.cursor_pos = editor.buffer.items.len;
@@ -1081,7 +1073,6 @@ test "Editor consecutive tab completion on directory" {
     var editor = Editor.init(allocator, std.testing.io, std.process.Environ.empty, &term, "> ");
     defer editor.deinit();
 
-    // First tab completes 'cat sr' to 'cat src/'
     try editor.buffer.appendSlice("cat sr");
     editor.cursor_pos = editor.buffer.items.len;
     editor.collectCompletions();
@@ -1090,9 +1081,8 @@ test "Editor consecutive tab completion on directory" {
     editor.applySelectedCompletion(true);
     try std.testing.expectEqualStrings("cat src/", editor.buffer.items);
 
-    // Second tab on 'cat src/' must expand files inside src/
+    // Second tab must expand files inside src/
     editor.collectCompletions();
-    // In src/ there are completion.zig, editor.zig, etc.
     try std.testing.expect(editor.candidates.items.len > 1);
     var found_completion = false;
     for (editor.candidates.items) |cand| {
@@ -1116,7 +1106,6 @@ test "Editor z command consecutive tab completion" {
     const tmp_len = try tmp_dir.dir.realPath(std.testing.io, &tmp_buf);
     const tmp_path = tmp_buf[0..tmp_len];
 
-    // Set cwd to tmp_dir
     var old_cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const rc = posix.system.getcwd(&old_cwd_buf, old_cwd_buf.len);
     const old_cwd = if (posix.errno(rc) == .SUCCESS) std.mem.sliceTo(&old_cwd_buf, 0) else ".";
@@ -1134,7 +1123,6 @@ test "Editor z command consecutive tab completion" {
     var editor = Editor.init(allocator, std.testing.io, std.process.Environ.empty, &term, "> ");
     defer editor.deinit();
 
-    // First tab on 'z con' completes to 'z config/'
     try editor.buffer.appendSlice("z con");
     editor.cursor_pos = editor.buffer.items.len;
     editor.collectCompletions();
@@ -1143,7 +1131,7 @@ test "Editor z command consecutive tab completion" {
     editor.applySelectedCompletion(true);
     try std.testing.expectEqualStrings("z config/", editor.buffer.items);
 
-    // Second tab on 'z config/' must find subdirectories inside config/
+    // Second tab must find subdirectories inside config/
     editor.collectCompletions();
     try std.testing.expectEqual(@as(usize, 2), editor.candidates.items.len);
     var found_nvim = false;
