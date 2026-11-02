@@ -52,6 +52,10 @@ pub fn main(init: std.process.Init) !void {
     posix.sigaction(posix.SIG.TERM, &sa_term, null);
 
     try term.enableRaw();
+    if (init.minimal.environ.getPosix("_GHOST_DISABLED") != null) {
+        term.disableRaw();
+        return;
+    }
 
     var editor = Editor.init(allocator, init.io, init.minimal.environ, &term, prompt);
     defer editor.deinit();

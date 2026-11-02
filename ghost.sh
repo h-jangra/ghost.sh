@@ -58,6 +58,10 @@ _ghost_readline_hook() {
         return
     fi
 
+    if [[ -n "${_GHOST_DISABLED:-}" ]]; then
+        return
+    fi
+
     # Recursion guard: prevent re-entering loop if PROMPT_COMMAND invokes this hook
     if [[ -n "${_GHOST_ACTIVE:-}" ]]; then
         return "$?"
@@ -74,6 +78,10 @@ _ghost_readline_hook() {
     fi
 
     while true; do
+        if [[ -n "${_GHOST_DISABLED:-}" ]]; then
+            break
+        fi
+
         # Run prompt commands (e.g. zoxide, direnv, starship, PS1 generators)
         _ghost_run_prompt_command "$_ghost_last_status"
         _ghost_last_status=$?
@@ -131,3 +139,18 @@ if [[ "${PROMPT_COMMAND@a}" == *a* ]]; then
 else
     [[ "${PROMPT_COMMAND:-}" != *"_ghost_readline_hook"* ]] && PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }_ghost_readline_hook"
 fi
+
+ghost() {
+    case "${1:-}" in
+        off)
+            unset _GHOST_DISABLED 2>/dev/null; export _GHOST_DISABLED=1
+            ;;
+        on)
+            unset _GHOST_DISABLED
+            ;;
+        *)
+            echo "Usage: ghost {off|on}" >&2
+            return 1
+            ;;
+    esac
+}
