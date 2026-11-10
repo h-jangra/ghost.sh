@@ -4,12 +4,10 @@ const posix = std.posix;
 pub var global_term_ptr: ?*Term = null;
 
 pub fn sigintHandler(_: posix.SIG) callconv(.c) void {
-    if (global_term_ptr) |t| t.deinit();
     std.process.exit(130);
 }
 
 pub fn sigtermHandler(_: posix.SIG) callconv(.c) void {
-    if (global_term_ptr) |t| t.deinit();
     std.process.exit(143);
 }
 

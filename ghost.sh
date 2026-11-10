@@ -72,9 +72,9 @@ _ghost_readline_hook() {
     local hist_file="${HISTFILE:-$HOME/.bash_history}"
     local tmp_out
     if [[ -d /dev/shm && -w /dev/shm ]]; then
-        tmp_out="/dev/shm/ghost_out_$$"
+        tmp_out="$(mktemp /dev/shm/ghost_out_XXXXXX 2>/dev/null)" || tmp_out="$(mktemp)"
     else
-        tmp_out="/tmp/ghost_out_$$"
+        tmp_out="$(mktemp /tmp/ghost_out_XXXXXX 2>/dev/null)" || tmp_out="$(mktemp)"
     fi
 
     while true; do

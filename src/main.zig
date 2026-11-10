@@ -288,11 +288,16 @@ pub fn main(init: std.process.Init) !void {
             var path_z: [4096:0]u8 = undefined;
             if (completion.toCStr(&path_z, out_path)) |pz| {
                 const fd = posix.system.open(pz.ptr, posix.system.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
-                if (posix.errno(fd) == .SUCCESS) {
-                    defer _ = posix.system.close(@intCast(fd));
-                    terminal.writeAll(@intCast(fd), editor.buffer.items);
-                    terminal.writeAll(@intCast(fd), "\n");
+                if (posix.errno(fd) != .SUCCESS) {
+                    terminal.writeAll(term.tty_fd, "ghost: cannot open output file\r\n");
+                    std.process.exit(1);
                 }
+                defer _ = posix.system.close(@intCast(fd));
+                terminal.writeAll(@intCast(fd), editor.buffer.items);
+                terminal.writeAll(@intCast(fd), "\n");
+            } else {
+                terminal.writeAll(term.tty_fd, "ghost: output path too long\r\n");
+                std.process.exit(1);
             }
         } else {
             terminal.writeAll(posix.STDOUT_FILENO, editor.buffer.items);

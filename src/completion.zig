@@ -157,16 +157,17 @@ pub fn getProcEnviron(key: []const u8, out_buf: []u8) ?[]const u8 {
     if (posix.errno(fd) != .SUCCESS) return null;
     defer _ = posix.system.close(@intCast(fd));
 
-    var buf: [65536]u8 = undefined;
+    const S = struct { threadlocal var buf: [65536]u8 = undefined; };
+    const buf = &S.buf;
     var total_read: usize = 0;
     while (total_read < buf.len) {
-        const rc = posix.system.read(@intCast(fd), buf[total_read..].ptr, buf.len - total_read);
+        const rc = posix.system.read(@intCast(fd), buf.*[total_read..].ptr, buf.len - total_read);
         if (posix.errno(rc) != .SUCCESS or rc == 0) break;
         total_read += @intCast(rc);
     }
     if (total_read == 0) return null;
 
-    var it = std.mem.splitScalar(u8, buf[0..total_read], 0);
+    var it = std.mem.splitScalar(u8, buf.*[0..total_read], 0);
     while (it.next()) |entry| {
         if (std.mem.startsWith(u8, entry, key) and entry.len > key.len and entry[key.len] == '=') {
             const val = entry[key.len + 1 ..];

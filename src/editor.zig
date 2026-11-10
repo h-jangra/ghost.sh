@@ -581,14 +581,42 @@ pub const Editor = struct {
             "nano";
 
         var tmp_buf: [128]u8 = undefined;
-        const tmp_path = try std.fmt.bufPrint(&tmp_buf, "/tmp/ghost_edit_{d}.sh", .{posix.system.getpid()});
+        var tmp_path: []const u8 = "";
+        var attempts: usize = 0;
+        var created_fd: posix.fd_t = -1;
+        while (attempts < 16) : (attempts += 1) {
+            var rand_buf: [8]u8 = undefined;
+            self.io.random(&rand_buf);
+            const r = std.mem.readInt(u64, &rand_buf, .little);
+            tmp_path = std.fmt.bufPrint(&tmp_buf, "/tmp/ghost_edit_{d}_{x}.sh", .{ posix.system.getpid(), r }) catch return error.PathTooLong;
+            var path_z: [4096:0]u8 = undefined;
+            const pz = completion.toCStr(&path_z, tmp_path) orelse continue;
+            const fd = posix.system.open(pz.ptr, posix.system.O{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o600);
+            if (posix.errno(fd) == .SUCCESS) {
+                created_fd = @intCast(fd);
+                break;
+            }
+        }
+        if (created_fd < 0) return error.OpenFailed;
 
         var tmp_content = ArrayList(u8).init(self.allocator);
         defer tmp_content.deinit();
         try tmp_content.appendSlice(self.buffer.items);
         try tmp_content.append('\n');
 
-        try writeFile(tmp_path, tmp_content.items);
+        {
+            var total: usize = 0;
+            while (total < tmp_content.items.len) {
+                const rc = posix.system.write(created_fd, tmp_content.items.ptr + total, tmp_content.items.len - total);
+                if (posix.errno(rc) != .SUCCESS or rc == 0) {
+                    _ = posix.system.close(created_fd);
+                    deleteFile(tmp_path);
+                    return error.WriteFailed;
+                }
+                total += @intCast(rc);
+            }
+            _ = posix.system.close(created_fd);
+        }
         defer deleteFile(tmp_path);
 
         var term_ptr = @constCast(self.term);
