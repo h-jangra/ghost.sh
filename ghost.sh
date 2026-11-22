@@ -102,8 +102,10 @@ _ghost_readline_hook() {
             cmd=$(<"$tmp_out")
             > "$tmp_out"
             if [[ -n "$cmd" ]]; then
-                history -s "$cmd" 2>/dev/null
-                history -a 2>/dev/null
+                if [[ "$cmd" != " "* ]]; then
+                    history -s "$cmd" 2>/dev/null
+                    history -a 2>/dev/null
+                fi
                 if _ghost_try_autocd "$cmd"; then
                     _ghost_last_status=$?
                 else

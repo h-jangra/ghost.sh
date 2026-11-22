@@ -220,6 +220,7 @@ pub const Editor = struct {
         self.ghost_buf.clearRetainingCapacity();
         if (self.in_completion or self.in_paste or self.in_isearch) return;
         if (self.cursor_pos != self.buffer.items.len or self.buffer.items.len == 0) return;
+        if (self.buffer.items[0] == ' ') return;
 
         const input = self.buffer.items;
 
@@ -932,6 +933,24 @@ test "Editor updateGhost history match" {
     editor.acceptGhost();
     try std.testing.expectEqualStrings("git checkout -b feature-test", editor.buffer.items);
     try std.testing.expectEqual(editor.buffer.items.len, editor.cursor_pos);
+    try std.testing.expect(editor.ghost_suggestion == null);
+}
+
+test "Editor updateGhost ignorespace leading space" {
+    const allocator = std.testing.allocator;
+    const term = try Term.init();
+    defer @constCast(&term).deinit();
+
+    var editor = Editor.init(allocator, std.testing.io, std.process.Environ.empty, &term, "> ");
+    defer editor.deinit();
+
+    const h1 = try allocator.dupe(u8, "git checkout -b feature-test");
+    try editor.history.append(h1);
+
+    try editor.buffer.appendSlice(" git che");
+    editor.cursor_pos = editor.buffer.items.len;
+    editor.updateGhost();
+
     try std.testing.expect(editor.ghost_suggestion == null);
 }
 
